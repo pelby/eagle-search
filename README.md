@@ -53,7 +53,17 @@ This description is indexed alongside your existing tags, filenames, and annotat
 
 ## Screenshots
 
-*Coming soon*
+**Search results with image preview:**
+![Search results](screenshots/search-results.png)
+
+**AI-generated description and metadata:**
+![AI description](screenshots/ai-description.png)
+
+**Actions menu:**
+![Actions](screenshots/actions.png)
+
+**Raycast commands:**
+![Raycast commands](screenshots/raycast-commands.png)
 
 ## Prerequisites
 

@@ -9,9 +9,12 @@ function expandPath(p: string): string {
 
 export default async function ReindexCommand() {
   const prefs = getPreferenceValues<{ indexerPath?: string }>();
-  const indexerDir = expandPath(
-    prefs.indexerPath || "~/Workspaces/code-projects/eagle-search/indexer"
-  );
+  const rawPath = prefs.indexerPath;
+  if (!rawPath) {
+    await showHUD("Set 'Indexer Path' in Eagle Search extension preferences");
+    return;
+  }
+  const indexerDir = expandPath(rawPath);
 
   await showHUD("Indexing new Eagle images...");
 

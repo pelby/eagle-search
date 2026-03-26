@@ -22,7 +22,7 @@
       "description": "Path to Python indexer project",
       "type": "textfield",
       "required": false,
-      "default": "~/Workspaces/code-projects/eagle-search/indexer"
+      "default": ""
     }
   ],
   "commands": [

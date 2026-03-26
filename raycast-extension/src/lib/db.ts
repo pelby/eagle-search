@@ -32,16 +32,17 @@ function getDbPath(): string {
   return raw.startsWith("~") ? resolve(homedir(), raw.slice(2)) : raw;
 }
 
-function escapeQuery(query: string): string {
-  // Remove FTS5 special characters, keep alphanumeric and spaces
-  return query.replace(/['"*(){}[\]:^~!@#$%&\\]/g, " ").trim();
+function sanitiseForSql(input: string): string {
+  // Whitelist: only keep alphanumeric, spaces, hyphens, and underscores.
+  // This makes SQL injection impossible regardless of quoting context.
+  return input.replace(/[^a-zA-Z0-9\s\-_]/g, " ").replace(/\s+/g, " ").trim();
 }
 
 export async function searchImages(query: string, limit = 30): Promise<ImageResult[]> {
   const dbPath = getDbPath();
-  const escaped = escapeQuery(query);
+  const sanitised = sanitiseForSql(query);
 
-  if (!escaped) {
+  if (!sanitised) {
     return getAllImages(limit);
   }
 
@@ -52,7 +53,7 @@ export async function searchImages(query: string, limit = 30): Promise<ImageResu
       `SELECT i.*, images_fts.rank
        FROM images_fts
        JOIN images i ON images_fts.rowid = i.rowid
-       WHERE images_fts MATCH '${escaped}'
+       WHERE images_fts MATCH '${sanitised}'
        ORDER BY images_fts.rank
        LIMIT ${limit}`
     );
@@ -62,13 +63,9 @@ export async function searchImages(query: string, limit = 30): Promise<ImageResu
     }
 
     // Fall back to OR match
-    const orQuery = escaped
-      .split(/\s+/)
-      .filter((w) => w.length > 0)
-      .map((w) => `"${w}"`)
-      .join(" OR ");
-
-    if (orQuery) {
+    const words = sanitised.split(/\s+/).filter((w) => w.length > 0);
+    if (words.length > 0) {
+      const orQuery = words.map((w) => `"${w}"`).join(" OR ");
       const orResults = await executeSQL<ImageResult>(
         dbPath,
         `SELECT i.*, images_fts.rank
@@ -87,15 +84,14 @@ export async function searchImages(query: string, limit = 30): Promise<ImageResu
     // FTS5 not available -- fall back to LIKE
   }
 
-  // Final fallback: LIKE queries
-  const likePattern = `%${escaped}%`;
+  // Final fallback: LIKE queries (sanitised input contains no SQL metacharacters)
   return executeSQL<ImageResult>(
     dbPath,
     `SELECT * FROM images
-     WHERE name LIKE '${likePattern}'
-        OR ai_description LIKE '${likePattern}'
-        OR annotation LIKE '${likePattern}'
-        OR tags LIKE '${likePattern}'
+     WHERE name LIKE '%${sanitised}%'
+        OR ai_description LIKE '%${sanitised}%'
+        OR annotation LIKE '%${sanitised}%'
+        OR tags LIKE '%${sanitised}%'
      ORDER BY created_at DESC
      LIMIT ${limit}`
   );
