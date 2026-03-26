@@ -1,0 +1,62 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "eagle-search",
+  "title": "Eagle Search",
+  "description": "Semantic search across your Eagle image library",
+  "icon": "extension-icon.png",
+  "author": "pelby",
+  "categories": ["Media", "Productivity"],
+  "license": "MIT",
+  "preferences": [
+    {
+      "name": "dbPath",
+      "title": "Database Path",
+      "description": "Path to eagle-search SQLite database",
+      "type": "textfield",
+      "required": false,
+      "default": "~/.eagle-search/db.sqlite"
+    },
+    {
+      "name": "indexerPath",
+      "title": "Indexer Path",
+      "description": "Path to Python indexer project",
+      "type": "textfield",
+      "required": false,
+      "default": "~/Workspaces/code-projects/eagle-search/indexer"
+    }
+  ],
+  "commands": [
+    {
+      "name": "search-images",
+      "title": "Search Eagle Images",
+      "subtitle": "Eagle",
+      "description": "Search your Eagle library by visual content, style, or concept",
+      "mode": "view"
+    },
+    {
+      "name": "reindex",
+      "title": "Index New Eagle Images",
+      "subtitle": "Eagle",
+      "description": "Index new images added to Eagle since last run (skips already-indexed)",
+      "mode": "no-view"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.93.0",
+    "@raycast/utils": "^1.19.0"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^1.0.11",
+    "@types/node": "22.13.14",
+    "@types/react": "19.0.12",
+    "eslint": "^9.23.0",
+    "prettier": "^3.5.3",
+    "typescript": "^5.8.2"
+  },
+  "scripts": {
+    "build": "ray build",
+    "dev": "ray develop",
+    "fix-lint": "ray lint --fix",
+    "lint": "ray lint"
+  }
+}

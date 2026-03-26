@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Node
+node_modules/
+*.tgz
+
+# Raycast build output
+raycast-extension/build/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Data (local, not committed)
+data/
+
+# Environment
+.env
+.env.local
+
+# uv
+uv.lock
