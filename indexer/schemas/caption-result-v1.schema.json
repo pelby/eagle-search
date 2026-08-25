@@ -18,7 +18,7 @@
     "uncertainties"
   ],
   "properties": {
-    "contract_version": { "const": 1 },
+    "contract_version": { "type": "integer", "const": 1 },
     "image_type": { "type": "string", "minLength": 1, "maxLength": 100 },
     "diagram_types": { "$ref": "#/$defs/shortList", "maxItems": 6 },
     "subjects": { "$ref": "#/$defs/shortList", "maxItems": 12 },
@@ -34,7 +34,7 @@
         "required": ["text", "legibility"],
         "properties": {
           "text": { "type": "string", "maxLength": 1000 },
-          "legibility": { "enum": ["high", "medium", "low"] }
+          "legibility": { "type": "string", "enum": ["high", "medium", "low"] }
         }
       }
     },

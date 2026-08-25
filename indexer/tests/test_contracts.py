@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import unittest
+from pathlib import Path
 
 from src.contracts import CaptionReceiptV1, CaptionResultV1, ContractError
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 VALID_CAPTION = {
@@ -109,6 +114,17 @@ class CaptionReceiptContractTests(unittest.TestCase):
                 prompt_version="caption-v1",
                 created_at="2026-08-25T20:00:00Z",
             )
+
+
+class JsonSchemaContractTests(unittest.TestCase):
+    def test_caption_output_schema_has_explicit_types_for_constrained_scalars(self) -> None:
+        schema_path = ROOT / "schemas" / "caption-result-v1.schema.json"
+        with schema_path.open(encoding="utf-8") as schema_file:
+            schema = json.load(schema_file)
+
+        self.assertEqual(schema["properties"]["contract_version"]["type"], "integer")
+        visible_properties = schema["properties"]["visible_text"]["items"]["properties"]
+        self.assertEqual(visible_properties["legibility"]["type"], "string")
 
 
 if __name__ == "__main__":
