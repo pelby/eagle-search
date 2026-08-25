@@ -166,12 +166,16 @@ def init_db(path: Path | None = None) -> sqlite3.Connection:
     db_path = path or DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(db_path))
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    connection.execute("PRAGMA busy_timeout = 3000")
-    connection.execute("PRAGMA journal_mode = WAL")
-    _migrate(connection)
-    return connection
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 3000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        _migrate(connection)
+        return connection
+    except Exception:
+        connection.close()
+        raise
 
 
 def get_indexed_ids(connection: sqlite3.Connection) -> set[str]:

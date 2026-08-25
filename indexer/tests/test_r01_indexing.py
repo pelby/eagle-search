@@ -117,6 +117,13 @@ class TransientThumbnailEagle(FakeEagle):
         return str(self.thumbnail)
 
 
+class UnavailableThumbnailEagle(FakeEagle):
+    async def get_thumbnail_path(self, item_id: str):
+        self.thumbnail_calls += 1
+        self.assert_item(item_id)
+        return None
+
+
 class IndexingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -167,6 +174,20 @@ class IndexingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(outcome.captioned, 1)
         self.assertEqual(eagle.thumbnail_calls, 2)
+
+    async def test_unavailable_thumbnail_is_reported_without_destroying_state(self) -> None:
+        eagle = UnavailableThumbnailEagle(self.thumbnail)
+        outcome = await index_library(
+            home=self.home,
+            eagle=eagle,
+            embedder=FakeEmbedder(),
+            caption_provider=self.provider,
+        )
+
+        self.assertEqual(outcome.discovered, 1)
+        self.assertEqual(outcome.updated, 0)
+        self.assertEqual(outcome.unavailable, 1)
+        self.assertEqual(outcome.removed, 0)
 
     async def test_changed_eagle_source_refreshes_cached_thumbnail_and_caption(self) -> None:
         await index_library(

@@ -60,6 +60,7 @@ class EmbeddedMetadata:
 class IndexOutcome:
     discovered: int
     updated: int
+    unavailable: int
     removed: int
     queued: int
     captioned: int
@@ -342,6 +343,7 @@ async def index_library(
             return await prepare(item)
 
     prepared = await asyncio.gather(*(bounded(item) for item in selected))
+    unavailable = sum(value is None for value in prepared)
     for value in prepared:
         if value is None:
             continue
@@ -505,6 +507,7 @@ async def index_library(
     return IndexOutcome(
         discovered=len(items),
         updated=updated,
+        unavailable=unavailable,
         removed=removed,
         queued=queued,
         captioned=captioned,
