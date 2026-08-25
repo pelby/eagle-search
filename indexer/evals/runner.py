@@ -168,8 +168,24 @@ def load_fixture_manifest(snapshot: Path, *, enforce_private_root: bool = True) 
     manifest_path = root / "manifest.json"
     with manifest_path.open(encoding="utf-8") as manifest_file:
         payload = json.load(manifest_file)
-    if set(payload) != {"snapshot_version", "snapshot_id", "fixtures"}:
+    allowed_envelopes = (
+        {"snapshot_version", "snapshot_id", "fixtures"},
+        {
+            "snapshot_version",
+            "snapshot_id",
+            "seed",
+            "fixtures",
+            "hidden_sealing_inputs",
+            "hidden_seal",
+        },
+    )
+    if set(payload) not in allowed_envelopes:
         raise ValueError("private fixture manifest has unexpected keys")
+    if "hidden_seal" in payload:
+        # Import lazily: fixture_builder imports this module's seal helper.
+        from .fixture_builder import validate_private_manifest
+
+        validate_private_manifest(payload)
     if payload["snapshot_version"] != 1 or not isinstance(payload["snapshot_id"], str):
         raise ValueError("unsupported private fixture manifest version")
     if not isinstance(payload["fixtures"], list):
