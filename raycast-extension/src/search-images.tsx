@@ -1,7 +1,18 @@
-import { Action, ActionPanel, getPreferenceValues, Icon, List } from "@raycast/api";
+import {
+  Action,
+  ActionPanel,
+  getPreferenceValues,
+  Icon,
+  Keyboard,
+  List,
+} from "@raycast/api";
 import { useEffect, useState } from "react";
 import { revealInFinder } from "./lib/eagle";
-import { createIndexerClient, IndexerClientError, type SearchResultV1 } from "./lib/indexer";
+import {
+  createIndexerClient,
+  IndexerClientError,
+  type SearchResultV1,
+} from "./lib/indexer";
 import { runUv } from "./lib/process";
 import { homedir } from "os";
 import { resolve } from "path";
@@ -15,7 +26,11 @@ function formatDimensions(w: number, h: number): string {
   return `${w}×${h}`;
 }
 
-function buildDetailMarkdown(item: SearchResultV1, thumbPath: string, dims: string): string {
+function buildDetailMarkdown(
+  item: SearchResultV1,
+  thumbPath: string,
+  dims: string,
+): string {
   const parts: string[] = [];
 
   // Image takes full width at the top
@@ -32,7 +47,12 @@ function buildDetailMarkdown(item: SearchResultV1, thumbPath: string, dims: stri
 
   // Tags
   if (item.tags) {
-    parts.push(`\n${item.tags.split(", ").map((t) => "`" + t + "`").join("  ")}`);
+    parts.push(
+      `\n${item.tags
+        .split(", ")
+        .map((t) => "`" + t + "`")
+        .join("  ")}`,
+    );
   }
 
   // AI description
@@ -49,7 +69,9 @@ export default function SearchEagleImages() {
   const [isLoading, setIsLoading] = useState(true);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const indexerPath = expandPath(getPreferenceValues<{ indexerPath?: string }>().indexerPath || "");
+  const indexerPath = expandPath(
+    getPreferenceValues<{ indexerPath?: string }>().indexerPath || "",
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -62,12 +84,20 @@ export default function SearchEagleImages() {
         const response = await client.search(searchText, 30, controller.signal);
         if (controller.signal.aborted) return;
         setResults(response.results);
-        setWarnings(response.retrieval.semantic_available ? [] : response.retrieval.warnings);
+        setWarnings(
+          response.retrieval.semantic_available
+            ? []
+            : response.retrieval.warnings,
+        );
       } catch (err) {
         if (controller.signal.aborted) return;
         setResults([]);
         setWarnings([]);
-        setError(err instanceof IndexerClientError ? err.message : "Eagle Search is unavailable");
+        setError(
+          err instanceof IndexerClientError
+            ? err.message
+            : "Eagle Search is unavailable",
+        );
       } finally {
         if (!controller.signal.aborted) setIsLoading(false);
       }
@@ -90,10 +120,19 @@ export default function SearchEagleImages() {
       navigationTitle={`Eagle Search${results.length > 0 ? ` (${results.length})` : ""}`}
     >
       {warnings.map((warning) => (
-        <List.Item key={`warning:${warning}`} title="Semantic search unavailable" subtitle={warning} icon={Icon.ExclamationMark} />
+        <List.Item
+          key={`warning:${warning}`}
+          title="Semantic search unavailable"
+          subtitle={warning}
+          icon={Icon.ExclamationMark}
+        />
       ))}
       {error ? (
-        <List.EmptyView title="Eagle Search unavailable" description={error} icon={Icon.ExclamationMark} />
+        <List.EmptyView
+          title="Eagle Search unavailable"
+          description={error}
+          icon={Icon.ExclamationMark}
+        />
       ) : results.length === 0 && !isLoading ? (
         <List.EmptyView
           title="No images found"
@@ -138,7 +177,7 @@ export default function SearchEagleImages() {
                   <Action.Open
                     title="Open with Default App"
                     target={imagePath || thumbPath}
-                    shortcut={{ modifiers: ["cmd", "shift"], key: "o" }}
+                    shortcut={Keyboard.Shortcut.Common.OpenWith}
                   />
                   {item.ai_description ? (
                     <Action.CopyToClipboard

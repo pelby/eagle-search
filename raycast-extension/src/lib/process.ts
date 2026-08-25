@@ -6,7 +6,11 @@ import type { ProcessResult, ProcessRunner } from "./indexer";
 
 export const runUv: ProcessRunner = (cwd, args, signal) =>
   new Promise<ProcessResult>((resolve, reject) => {
-    const child = spawn("uv", args, { cwd, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("uv", args, {
+      cwd,
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
@@ -17,12 +21,16 @@ export const runUv: ProcessRunner = (cwd, args, signal) =>
   });
 
 export function launchUvIndex(cwd: string): number | undefined {
-  const child = spawn("uv", ["run", "python", "-m", "src", "index", "--format", "jsonl"], {
-    cwd,
-    detached: true,
-    shell: false,
-    stdio: "ignore",
-  });
+  const child = spawn(
+    "uv",
+    ["run", "python", "-m", "src", "index", "--format", "jsonl"],
+    {
+      cwd,
+      detached: true,
+      shell: false,
+      stdio: "ignore",
+    },
+  );
   child.on("error", () => undefined);
   child.unref();
   return child.pid;

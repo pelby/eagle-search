@@ -17,5 +17,9 @@ export default async function ReindexCommand() {
   const indexerDir = expandPath(rawPath);
 
   const pid = launchUvIndex(indexerDir);
-  await showHUD(pid ? "Indexing started — check Eagle Search Status" : "Indexing start was not acknowledged");
+  await showHUD(
+    pid
+      ? "Indexing started — check Eagle Search Status"
+      : "Indexing start was not acknowledged",
+  );
 }

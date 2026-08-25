@@ -8,8 +8,6 @@
 /* eslint-disable @typescript-eslint/ban-types */
 
 type ExtensionPreferences = {
-  /** Database Path - Path to eagle-search SQLite database */
-  "dbPath": string,
   /** Indexer Path - Path to Python indexer project */
   "indexerPath": string
 }
@@ -22,6 +20,8 @@ declare namespace Preferences {
   export type SearchImages = ExtensionPreferences & {}
   /** Preferences accessible in the `reindex` command */
   export type Reindex = ExtensionPreferences & {}
+  /** Preferences accessible in the `status` command */
+  export type Status = ExtensionPreferences & {}
 }
 
 declare namespace Arguments {
@@ -29,5 +29,7 @@ declare namespace Arguments {
   export type SearchImages = {}
   /** Arguments passed to the `reindex` command */
   export type Reindex = {}
+  /** Arguments passed to the `status` command */
+  export type Status = {}
 }
 

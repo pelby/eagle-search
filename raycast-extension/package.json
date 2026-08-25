@@ -1,11 +1,15 @@
 {
   "$schema": "https://www.raycast.com/schemas/extension.json",
   "name": "eagle-search",
+  "type": "module",
   "title": "Eagle Search",
   "description": "Semantic search across your Eagle image library",
   "icon": "extension-icon.png",
   "author": "pelby",
-  "categories": ["Media", "Productivity"],
+  "categories": [
+    "Media",
+    "Productivity"
+  ],
   "license": "MIT",
   "preferences": [
     {
@@ -45,12 +49,20 @@
     "@raycast/utils": "^1.19.0"
   },
   "devDependencies": {
-    "@raycast/eslint-config": "^1.0.11",
+    "@raycast/eslint-config": "^2.2.0",
     "@types/node": "22.13.14",
     "@types/react": "19.0.12",
-    "eslint": "^9.23.0",
+    "eslint": "^10.9.1",
     "prettier": "^3.5.3",
     "typescript": "^5.8.2"
+  },
+  "overrides": {
+    "brace-expansion@>=2.0.0 <3": "2.1.4",
+    "@oclif/core": {
+      "minimatch": {
+        "brace-expansion": "5.0.9"
+      }
+    }
   },
   "scripts": {
     "build": "ray build",

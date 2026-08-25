@@ -23,7 +23,11 @@ export interface SearchResponseV1 {
   contract_version: 1;
   ok: boolean;
   query: { text: string; limit: number };
-  retrieval: { mode: "browse" | "exact" | "lexical" | "hybrid"; semantic_available: boolean; warnings: string[] };
+  retrieval: {
+    mode: "browse" | "exact" | "lexical" | "hybrid";
+    semantic_available: boolean;
+    warnings: string[];
+  };
   results: SearchResultV1[];
   error?: { code: string; message: string };
 }
@@ -49,7 +53,11 @@ export interface ProcessResult {
   stderr: string;
 }
 
-export type ProcessRunner = (cwd: string, args: string[], signal?: AbortSignal) => Promise<ProcessResult>;
+export type ProcessRunner = (
+  cwd: string,
+  args: string[],
+  signal?: AbortSignal,
+) => Promise<ProcessResult>;
 
 export class IndexerClientError extends Error {
   readonly code: string;
@@ -66,20 +74,33 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function stringField(value: unknown, name: string): string {
-  if (typeof value !== "string") throw new IndexerClientError("invalid_response", `Indexer returned invalid ${name}`);
+  if (typeof value !== "string")
+    throw new IndexerClientError(
+      "invalid_response",
+      `Indexer returned invalid ${name}`,
+    );
   return value;
 }
 
 function numberField(value: unknown, name: string): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new IndexerClientError("invalid_response", `Indexer returned invalid ${name}`);
+    throw new IndexerClientError(
+      "invalid_response",
+      `Indexer returned invalid ${name}`,
+    );
   }
   return value;
 }
 
 function stringArray(value: unknown, name: string): string[] {
-  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string")) {
-    throw new IndexerClientError("invalid_response", `Indexer returned invalid ${name}`);
+  if (
+    !Array.isArray(value) ||
+    value.some((entry) => typeof entry !== "string")
+  ) {
+    throw new IndexerClientError(
+      "invalid_response",
+      `Indexer returned invalid ${name}`,
+    );
   }
   return value;
 }
@@ -98,42 +119,93 @@ function parseJson(stdout: string): unknown {
   try {
     return JSON.parse(stdout);
   } catch {
-    throw new IndexerClientError("invalid_response", "Eagle Search returned malformed JSON");
+    throw new IndexerClientError(
+      "invalid_response",
+      "Eagle Search returned malformed JSON",
+    );
   }
 }
 
-function errorEnvelope(payload: Record<string, unknown>): { code: string; message: string } | undefined {
+function errorEnvelope(
+  payload: Record<string, unknown>,
+): { code: string; message: string } | undefined {
   if (payload.error === undefined) return undefined;
-  if (!isRecord(payload.error)) throw new IndexerClientError("invalid_response", "Indexer returned invalid error envelope");
-  return { code: stringField(payload.error.code, "error.code"), message: stringField(payload.error.message, "error.message") };
+  if (!isRecord(payload.error))
+    throw new IndexerClientError(
+      "invalid_response",
+      "Indexer returned invalid error envelope",
+    );
+  return {
+    code: stringField(payload.error.code, "error.code"),
+    message: stringField(payload.error.message, "error.message"),
+  };
 }
 
 export function parseSearchResponse(value: unknown): SearchResponseV1 {
-  if (!isRecord(value)) throw new IndexerClientError("invalid_response", "Indexer returned an invalid search response");
-  if (value.contract_version !== 1 || typeof value.ok !== "boolean" || !isRecord(value.query) || !isRecord(value.retrieval)) {
-    throw new IndexerClientError("invalid_response", "Indexer returned an unsupported search response");
+  if (!isRecord(value))
+    throw new IndexerClientError(
+      "invalid_response",
+      "Indexer returned an invalid search response",
+    );
+  if (
+    value.contract_version !== 1 ||
+    typeof value.ok !== "boolean" ||
+    !isRecord(value.query) ||
+    !isRecord(value.retrieval)
+  ) {
+    throw new IndexerClientError(
+      "invalid_response",
+      "Indexer returned an unsupported search response",
+    );
   }
   const error = errorEnvelope(value);
-  if (!value.ok) throw new IndexerClientError(error?.code ?? "indexer_error", error?.message ?? "Eagle Search could not complete the request");
+  if (!value.ok)
+    throw new IndexerClientError(
+      error?.code ?? "indexer_error",
+      error?.message ?? "Eagle Search could not complete the request",
+    );
   const retrievalMode = stringField(value.retrieval.mode, "retrieval.mode");
-  if (!(["browse", "exact", "lexical", "hybrid"] as string[]).includes(retrievalMode)) {
-    throw new IndexerClientError("invalid_response", "Indexer returned invalid retrieval.mode");
+  if (
+    !(["browse", "exact", "lexical", "hybrid"] as string[]).includes(
+      retrievalMode,
+    )
+  ) {
+    throw new IndexerClientError(
+      "invalid_response",
+      "Indexer returned invalid retrieval.mode",
+    );
   }
-  if (typeof value.retrieval.semantic_available !== "boolean" || !Array.isArray(value.results)) {
-    throw new IndexerClientError("invalid_response", "Indexer returned invalid search fields");
+  if (
+    typeof value.retrieval.semantic_available !== "boolean" ||
+    !Array.isArray(value.results)
+  ) {
+    throw new IndexerClientError(
+      "invalid_response",
+      "Indexer returned invalid search fields",
+    );
   }
   const results = value.results.map((entry): SearchResultV1 => {
-    if (!isRecord(entry)) throw new IndexerClientError("invalid_response", "Indexer returned an invalid result");
+    if (!isRecord(entry))
+      throw new IndexerClientError(
+        "invalid_response",
+        "Indexer returned an invalid result",
+      );
     return {
       eagle_id: stringField(entry.eagle_id, "result.eagle_id"),
       name: stringField(entry.name, "result.name"),
-      thumbnail_path: stringField(entry.thumbnail_path, "result.thumbnail_path"),
+      thumbnail_path: stringField(
+        entry.thumbnail_path,
+        "result.thumbnail_path",
+      ),
       image_path: stringField(entry.image_path, "result.image_path"),
       score: numberField(entry.score, "result.score"),
       matched_by: stringArray(entry.matched_by, "result.matched_by"),
       tags: optionalString(entry.tags, "result.tags"),
       annotation: optionalString(entry.annotation, "result.annotation"),
-      ai_description: optionalString(entry.ai_description, "result.ai_description"),
+      ai_description: optionalString(
+        entry.ai_description,
+        "result.ai_description",
+      ),
       folder_name: optionalString(entry.folder_name, "result.folder_name"),
       ext: optionalString(entry.ext, "result.ext"),
       width: optionalNumber(entry.width, "result.width"),
@@ -144,7 +216,10 @@ export function parseSearchResponse(value: unknown): SearchResponseV1 {
   return {
     contract_version: 1,
     ok: true,
-    query: { text: stringField(value.query.text, "query.text"), limit: numberField(value.query.limit, "query.limit") },
+    query: {
+      text: stringField(value.query.text, "query.text"),
+      limit: numberField(value.query.limit, "query.limit"),
+    },
     retrieval: {
       mode: retrievalMode as SearchResponseV1["retrieval"]["mode"],
       semantic_available: value.retrieval.semantic_available,
@@ -156,11 +231,22 @@ export function parseSearchResponse(value: unknown): SearchResponseV1 {
 
 export function parseRunStatus(value: unknown): RunStatusV1 {
   if (!isRecord(value) || value.contract_version !== 1) {
-    throw new IndexerClientError("invalid_response", "Indexer returned an invalid status response");
+    throw new IndexerClientError(
+      "invalid_response",
+      "Indexer returned an invalid status response",
+    );
   }
   const state = stringField(value.state, "status.state");
-  if (!(["idle", "running", "complete", "failed", "blocked"] as string[]).includes(state) || typeof value.semantic_available !== "boolean") {
-    throw new IndexerClientError("invalid_response", "Indexer returned an invalid status response");
+  if (
+    !(
+      ["idle", "running", "complete", "failed", "blocked"] as string[]
+    ).includes(state) ||
+    typeof value.semantic_available !== "boolean"
+  ) {
+    throw new IndexerClientError(
+      "invalid_response",
+      "Indexer returned an invalid status response",
+    );
   }
   return {
     contract_version: 1,
@@ -178,11 +264,31 @@ export function parseRunStatus(value: unknown): RunStatusV1 {
   };
 }
 
-export function buildSearchArgs(query: string, limit: number, mode: SearchMode = "automatic"): string[] {
-  if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new IndexerClientError("invalid_request", "Search result limit must be between 1 and 100");
+export function buildSearchArgs(
+  query: string,
+  limit: number,
+  mode: SearchMode = "automatic",
+): string[] {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100)
+    throw new IndexerClientError(
+      "invalid_request",
+      "Search result limit must be between 1 and 100",
+    );
   // Raycast is an interactive first-party surface, so query logging remains enabled.
   // The optional --no-log flag stays available to non-interactive callers only.
-  return ["run", "python", "-m", "src", "search", query, "--mode", mode, "--limit", String(limit), "--json"];
+  return [
+    "run",
+    "python",
+    "-m",
+    "src",
+    "search",
+    query,
+    "--mode",
+    mode,
+    "--limit",
+    String(limit),
+    "--json",
+  ];
 }
 
 export interface IndexerClientOptions {
@@ -190,17 +296,39 @@ export interface IndexerClientOptions {
   run: ProcessRunner;
 }
 
-export function createIndexerClient({ indexerPath, run }: IndexerClientOptions) {
-  if (!indexerPath.trim()) throw new IndexerClientError("configuration", "Set the Indexer Path in Eagle Search preferences");
-  const execute = async (args: string[], signal?: AbortSignal): Promise<unknown> => {
+export function createIndexerClient({
+  indexerPath,
+  run,
+}: IndexerClientOptions) {
+  if (!indexerPath.trim())
+    throw new IndexerClientError(
+      "configuration",
+      "Set the Indexer Path in Eagle Search preferences",
+    );
+  const execute = async (
+    args: string[],
+    signal?: AbortSignal,
+  ): Promise<unknown> => {
     const result = await run(indexerPath, args, signal);
     const payload = parseJson(result.stdout);
-    if (result.code !== 0 && isRecord(payload) && payload.error !== undefined) return payload;
-    if (result.code !== 0) throw new IndexerClientError("indexer_failed", "Eagle Search could not complete the request");
+    if (result.code !== 0 && isRecord(payload) && payload.error !== undefined)
+      return payload;
+    if (result.code !== 0)
+      throw new IndexerClientError(
+        "indexer_failed",
+        "Eagle Search could not complete the request",
+      );
     return payload;
   };
   return {
-    search: async (query: string, limit = 30, signal?: AbortSignal) => parseSearchResponse(await execute(buildSearchArgs(query, limit), signal)),
-    status: async (signal?: AbortSignal) => parseRunStatus(await execute(["run", "python", "-m", "src", "status", "--json"], signal)),
+    search: async (query: string, limit = 30, signal?: AbortSignal) =>
+      parseSearchResponse(await execute(buildSearchArgs(query, limit), signal)),
+    status: async (signal?: AbortSignal) =>
+      parseRunStatus(
+        await execute(
+          ["run", "python", "-m", "src", "status", "--json"],
+          signal,
+        ),
+      ),
   };
 }
