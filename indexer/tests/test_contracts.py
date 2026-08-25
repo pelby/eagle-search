@@ -123,6 +123,8 @@ class JsonSchemaContractTests(unittest.TestCase):
             schema = json.load(schema_file)
 
         self.assertEqual(schema["properties"]["contract_version"]["type"], "integer")
+        self.assertEqual(schema["properties"]["diagram_types"]["type"], "array")
+        self.assertNotIn("$ref", schema["properties"]["diagram_types"])
         visible_properties = schema["properties"]["visible_text"]["items"]["properties"]
         self.assertEqual(visible_properties["legibility"]["type"], "string")
 

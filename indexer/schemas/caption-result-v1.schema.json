@@ -20,11 +20,31 @@
   "properties": {
     "contract_version": { "type": "integer", "const": 1 },
     "image_type": { "type": "string", "minLength": 1, "maxLength": 100 },
-    "diagram_types": { "$ref": "#/$defs/shortList", "maxItems": 6 },
-    "subjects": { "$ref": "#/$defs/shortList", "maxItems": 12 },
-    "visual_style": { "$ref": "#/$defs/shortList", "maxItems": 8 },
-    "colours": { "$ref": "#/$defs/shortList", "maxItems": 10 },
-    "layout": { "$ref": "#/$defs/shortList", "maxItems": 10 },
+    "diagram_types": {
+      "type": "array",
+      "maxItems": 6,
+      "items": { "type": "string", "minLength": 1, "maxLength": 300 }
+    },
+    "subjects": {
+      "type": "array",
+      "maxItems": 12,
+      "items": { "type": "string", "minLength": 1, "maxLength": 300 }
+    },
+    "visual_style": {
+      "type": "array",
+      "maxItems": 8,
+      "items": { "type": "string", "minLength": 1, "maxLength": 300 }
+    },
+    "colours": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string", "minLength": 1, "maxLength": 300 }
+    },
+    "layout": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string", "minLength": 1, "maxLength": 300 }
+    },
     "visible_text": {
       "type": "array",
       "maxItems": 40,
@@ -38,13 +58,15 @@
         }
       }
     },
-    "search_terms": { "$ref": "#/$defs/shortList", "maxItems": 12 },
-    "summary": { "type": "string", "minLength": 1, "maxLength": 1000 },
-    "uncertainties": { "$ref": "#/$defs/shortList", "maxItems": 8 }
-  },
-  "$defs": {
-    "shortList": {
+    "search_terms": {
       "type": "array",
+      "maxItems": 12,
+      "items": { "type": "string", "minLength": 1, "maxLength": 300 }
+    },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 1000 },
+    "uncertainties": {
+      "type": "array",
+      "maxItems": 8,
       "items": { "type": "string", "minLength": 1, "maxLength": 300 }
     }
   }

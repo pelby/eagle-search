@@ -83,6 +83,14 @@ class CodexCaptionRunnerTests(unittest.TestCase):
 
         argv, kwargs = self.calls[0]
         self.assertEqual(argv[:3], ["codex-test", "exec", "--ephemeral"])
+        self.assertIn("--ignore-user-config", argv)
+        self.assertIn("--ignore-rules", argv)
+        disabled_features = {
+            argv[index + 1]
+            for index, value in enumerate(argv[:-1])
+            if value == "--disable"
+        }
+        self.assertEqual(disabled_features, {"plugins", "apps", "memories", "skill_search"})
         self.assertIn("--sandbox", argv)
         self.assertEqual(argv[argv.index("--sandbox") + 1], "read-only")
         self.assertEqual(argv[argv.index("-m") + 1], "gpt-5.6-luna")
