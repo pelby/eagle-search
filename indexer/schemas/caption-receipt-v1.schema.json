@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eagle-search.local/schemas/caption-receipt-v1.schema.json",
+  "title": "CaptionReceiptV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "receipt_version",
+    "receipt_id",
+    "image_hash",
+    "caption_result",
+    "search_text",
+    "provider",
+    "model",
+    "effort",
+    "prompt_version",
+    "schema_version",
+    "created_at",
+    "source"
+  ],
+  "properties": {
+    "receipt_version": { "const": 1 },
+    "receipt_id": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "image_hash": { "type": "string", "pattern": "^sha256:[a-f0-9]{64}$" },
+    "caption_result": { "$ref": "caption-result-v1.schema.json" },
+    "search_text": { "type": "string", "maxLength": 20000 },
+    "provider": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "model": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "effort": { "type": "string", "minLength": 1, "maxLength": 30 },
+    "prompt_version": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "schema_version": { "const": 1 },
+    "created_at": { "type": "string", "format": "date-time" },
+    "source": { "enum": ["vision", "legacy"] }
+  }
+}

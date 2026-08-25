@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eagle-search.local/schemas/run-status-v1.schema.json",
+  "title": "RunStatusV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "run_id",
+    "state",
+    "stage",
+    "total",
+    "completed",
+    "pending",
+    "failed",
+    "provider",
+    "model",
+    "semantic_available",
+    "last_error"
+  ],
+  "properties": {
+    "contract_version": { "const": 1 },
+    "run_id": { "type": "string" },
+    "state": { "enum": ["idle", "running", "complete", "failed", "blocked"] },
+    "stage": { "type": "string" },
+    "total": { "type": "integer", "minimum": 0 },
+    "completed": { "type": "integer", "minimum": 0 },
+    "pending": { "type": "integer", "minimum": 0 },
+    "failed": { "type": "integer", "minimum": 0 },
+    "provider": { "type": "string" },
+    "model": { "type": "string" },
+    "semantic_available": { "type": "boolean" },
+    "last_error": { "type": "string" }
+  }
+}

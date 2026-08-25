@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eagle-search.local/schemas/search-response-v1.schema.json",
+  "title": "SearchResponseV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "ok", "query", "retrieval", "results"],
+  "properties": {
+    "contract_version": { "const": 1 },
+    "ok": { "type": "boolean" },
+    "query": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["text", "limit"],
+      "properties": {
+        "text": { "type": "string" },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
+      }
+    },
+    "retrieval": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "semantic_available", "warnings"],
+      "properties": {
+        "mode": { "enum": ["browse", "exact", "lexical", "hybrid"] },
+        "semantic_available": { "type": "boolean" },
+        "warnings": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["eagle_id", "name", "thumbnail_path", "image_path", "score", "matched_by"],
+        "properties": {
+          "eagle_id": { "type": "string" },
+          "name": { "type": "string" },
+          "thumbnail_path": { "type": "string" },
+          "image_path": { "type": "string" },
+          "score": { "type": "number" },
+          "matched_by": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" }
+      }
+    }
+  }
+}

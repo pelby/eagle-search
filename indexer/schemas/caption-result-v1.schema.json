@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://eagle-search.local/schemas/caption-result-v1.schema.json",
+  "title": "CaptionResultV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "contract_version",
+    "image_type",
+    "diagram_types",
+    "subjects",
+    "visual_style",
+    "colours",
+    "layout",
+    "visible_text",
+    "search_terms",
+    "summary",
+    "uncertainties"
+  ],
+  "properties": {
+    "contract_version": { "const": 1 },
+    "image_type": { "type": "string", "minLength": 1, "maxLength": 100 },
+    "diagram_types": { "$ref": "#/$defs/shortList", "maxItems": 6 },
+    "subjects": { "$ref": "#/$defs/shortList", "maxItems": 12 },
+    "visual_style": { "$ref": "#/$defs/shortList", "maxItems": 8 },
+    "colours": { "$ref": "#/$defs/shortList", "maxItems": 10 },
+    "layout": { "$ref": "#/$defs/shortList", "maxItems": 10 },
+    "visible_text": {
+      "type": "array",
+      "maxItems": 40,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "legibility"],
+        "properties": {
+          "text": { "type": "string", "maxLength": 1000 },
+          "legibility": { "enum": ["high", "medium", "low"] }
+        }
+      }
+    },
+    "search_terms": { "$ref": "#/$defs/shortList", "maxItems": 12 },
+    "summary": { "type": "string", "minLength": 1, "maxLength": 1000 },
+    "uncertainties": { "$ref": "#/$defs/shortList", "maxItems": 8 }
+  },
+  "$defs": {
+    "shortList": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 300 }
+    }
+  }
+}
