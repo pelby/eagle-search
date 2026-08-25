@@ -16,6 +16,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
+from uuid import uuid4
 
 from . import db
 from .eagle.importer import FileIntentMetadataStore, GeneratedImageImporter
@@ -110,6 +111,18 @@ def _connection(runtime: CliRuntime, *, require_existing: bool = False) -> sqlit
     if require_existing and not runtime.database_path.is_file():
         raise FileNotFoundError(f"search database does not exist: {runtime.database_path}")
     return db.init_db(runtime.database_path)
+
+
+def _write_private_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o600)
+    temporary.replace(path)
 
 
 def _command_search(arguments: argparse.Namespace, runtime: CliRuntime) -> dict[str, Any]:
@@ -222,25 +235,80 @@ def _command_notes_sync(arguments: argparse.Namespace, runtime: CliRuntime) -> d
         if arguments.id and not rows:
             raise CliRequestError(f"unknown Eagle item: {arguments.id}")
         receipt_store = FileReceiptStore(runtime.receipts_path)
+        eagle = _runtime_eagle(runtime)
         applier = NotesApplier(
-            _runtime_eagle(runtime),
+            eagle,
             FileLock(runtime.home / "notes.lock"),
         )
+        run_id = str(uuid4())
+        journal_path = runtime.home / "notes-runs" / f"{run_id}.json"
+        journal: dict[str, Any] = {
+            "contract_version": 1,
+            "run_id": run_id,
+            "mode": "apply" if arguments.apply else "dry-run",
+            "state": "running",
+            "selected_count": len(rows),
+            "initial_snapshots": [],
+            "results": [],
+        }
+        _write_private_json(journal_path, journal)
 
-        async def run_sync() -> list[dict[str, Any]]:
+        async def run_sync() -> tuple[list[dict[str, Any]], bool]:
             results: list[dict[str, Any]] = []
+            operations: list[tuple[str, Any]] = []
             for row in rows:
                 eagle_id = str(row["eagle_id"])
                 receipt = receipt_store.resolve_active(str(row["image_hash"]))
                 if receipt is None:
-                    results.append(
+                    refused = (
                         {
                             "eagle_id": eagle_id,
                             "status": "refused",
                             "refusal_reason": "active immutable caption receipt is missing",
                         }
                     )
+                    results.append(refused)
+                    journal["results"] = results
+                    if arguments.apply:
+                        journal["state"] = "stopped"
+                        _write_private_json(journal_path, journal)
+                        return results, True
                     continue
+                operations.append((eagle_id, receipt))
+
+            if arguments.apply:
+                snapshots: list[dict[str, Any]] = []
+                for eagle_id, _receipt in operations:
+                    item = await eagle.get_item(eagle_id)
+                    annotation = item.get("annotation")
+                    last_modified = item.get("lastModified")
+                    if (
+                        item.get("id") != eagle_id
+                        or not isinstance(annotation, str)
+                        or isinstance(last_modified, bool)
+                        or not isinstance(last_modified, int)
+                    ):
+                        refused = {
+                            "eagle_id": eagle_id,
+                            "status": "refused",
+                            "refusal_reason": "Eagle Notes snapshot is malformed",
+                        }
+                        results.append(refused)
+                        journal["results"] = results
+                        journal["state"] = "stopped"
+                        _write_private_json(journal_path, journal)
+                        return results, True
+                    snapshots.append(
+                        {
+                            "eagle_id": eagle_id,
+                            "annotation": annotation,
+                            "last_modified": last_modified,
+                        }
+                    )
+                journal["initial_snapshots"] = snapshots
+                _write_private_json(journal_path, journal)
+
+            for eagle_id, receipt in operations:
                 result = await applier.sync(
                     eagle_id,
                     caption_block=render_caption_block(receipt),
@@ -258,14 +326,25 @@ def _command_notes_sync(arguments: argparse.Namespace, runtime: CliRuntime) -> d
                         "refusal_reason": result.refusal_reason,
                     }
                 )
-            return results
+                journal["results"] = results
+                if arguments.apply and result.status in {"refused", "ambiguous"}:
+                    journal["state"] = "stopped"
+                    _write_private_json(journal_path, journal)
+                    return results, True
+                _write_private_json(journal_path, journal)
+            journal["state"] = "complete"
+            _write_private_json(journal_path, journal)
+            return results, False
 
-        results = asyncio.run(run_sync())
+        results, stopped_early = asyncio.run(run_sync())
         unsafe = [entry for entry in results if entry["status"] in {"refused", "ambiguous"}]
         return {
             "contract_version": 1,
             "ok": not unsafe,
             "mode": "apply" if arguments.apply else "dry-run",
+            "journal_path": str(journal_path),
+            "stopped_early": stopped_early,
+            "skipped_count": max(0, len(rows) - len(results)) if stopped_early else 0,
             "results": results,
         }
     finally:
@@ -464,7 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
     index = commands.add_parser("index", help="Incrementally index Eagle and process missing captions")
     index.add_argument("--format", choices=("json", "jsonl"), default="json")
     index.add_argument("--max-items", type=int)
-    index.add_argument("--model", default="gpt-5.6-luna")
+    index.add_argument("--model", default="gpt-5.6-sol")
     index.add_argument("--effort", choices=("low", "medium"), default="low")
     index.add_argument("--json", action="store_true")
     index.set_defaults(handler=_command_index)

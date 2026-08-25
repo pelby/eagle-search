@@ -12,9 +12,11 @@ class CaptionSchemaTests(unittest.TestCase):
     def test_prompt_is_versioned_vision_only_and_does_not_leak_metadata(self) -> None:
         prompt = caption_prompt()
 
-        self.assertEqual(CAPTION_PROMPT_VERSION, "caption-v1")
+        self.assertEqual(CAPTION_PROMPT_VERSION, "caption-v2")
         self.assertIn("visible evidence", prompt.casefold())
         self.assertIn("do not infer", prompt.casefold())
+        self.assertIn("retrieval aliases, not factual claims", prompt.casefold())
+        self.assertIn("classroom", prompt.casefold())
         for forbidden in ("filename", "tags", "human notes", "generation prompt"):
             self.assertNotIn(forbidden, prompt.casefold())
 

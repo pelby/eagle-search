@@ -11,6 +11,7 @@ from statistics import fmean
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from src.selection_instrument import SelectionDocument, SelectionInstrument
+from src.captioning.prompt import CAPTION_PROMPT_VERSION
 
 from .metrics import ndcg_at_k, recall_at_k, reciprocal_rank
 
@@ -222,7 +223,7 @@ def run_caption_stage(
     models: Sequence[str],
     journal: PrivateReceiptJournal,
     caption: Callable[[EvalFixture, str], Mapping[str, Any]],
-    prompt_version: str = "caption-v1",
+    prompt_version: str = CAPTION_PROMPT_VERSION,
 ) -> list[dict[str, Any]]:
     """Run only missing fixture/model work and persist a local atomic resume receipt.
 

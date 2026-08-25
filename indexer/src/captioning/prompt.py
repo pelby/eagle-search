@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 
-CAPTION_PROMPT_VERSION = "caption-v1"
+CAPTION_PROMPT_VERSION = "caption-v2"
 _SCHEMA_PATH = Path(__file__).resolve().parents[2] / "schemas" / "caption-result-v1.schema.json"
 
 
@@ -22,9 +22,15 @@ def caption_prompt() -> str:
     return (
         "Describe this image for a local visual search index using only visible evidence. "
         "Record image and diagram type, concrete subjects, style, colours, layout, "
-        "legible visible text, and compact search aliases. Transcribe text only when "
-        "it is visibly legible. Do not infer unseen details, identities, brands, intent, "
-        "or relationships. Put ambiguity in uncertainties. Return only the required JSON."
+        "legible visible text, and compact search aliases. Keep the summary strictly literal. "
+        "For search_terms, include six to twelve concise aliases covering visible objects, "
+        "actions, composition, and broader activity, setting, or function when the visual "
+        "arrangement directly suggests it. For example, a figure pointing at a board or easel "
+        "can support presentation, teaching, classroom, or demonstration aliases even when the "
+        "literal room type is uncertain. These are retrieval aliases, not factual claims. "
+        "Transcribe text only when it is visibly legible. Do not infer unseen details, identities, "
+        "brands, intent, or relationships in factual fields. Put ambiguity in uncertainties. "
+        "Return only the required JSON."
     )
 
 

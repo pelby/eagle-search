@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from src import db
-from src.retrieval.hybrid import hybrid_search
+from src.retrieval.hybrid import hybrid_search, semantic_query_text, semantic_query_texts
 
 
 class FakeEmbedder:
@@ -19,7 +19,40 @@ class DownEmbedder(FakeEmbedder):
         raise RuntimeError("offline")
 
 
+class RecordingEmbedder(FakeEmbedder):
+    def __init__(self):
+        self.inputs = []
+
+    def embed(self, texts):
+        self.inputs.extend(texts)
+        return super().embed(texts)
+
+
 class HybridTests(unittest.TestCase):
+    def test_semantic_query_expansion_is_bounded_and_does_not_change_lexical_text(self) -> None:
+        self.assertEqual(
+            semantic_query_text("classroom"),
+            "classroom presentation teaching easel",
+        )
+        self.assertEqual(semantic_query_text("unrelated"), "unrelated")
+        self.assertEqual(
+            semantic_query_texts("classroom"),
+            (
+                "classroom",
+                "classroom presentation teaching easel",
+                "classroom teaching illustration presentation scene art demonstration easel",
+            ),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            connection = db.init_db(Path(directory) / "db.sqlite")
+            db.upsert_image(connection, {"eagle_id": "one", "name": "classroom"})
+            embedder = RecordingEmbedder()
+            hybrid_search(connection, "classroom", embedder)
+            self.assertEqual(embedder.inputs, list(semantic_query_texts("classroom")))
+            self.assertEqual(db.weighted_lexical_search(connection, "classroom")[0]["eagle_id"], "one")
+            connection.close()
+
     def test_rrf_floor_and_lexical_degradation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             connection = db.init_db(Path(directory) / "db.sqlite")

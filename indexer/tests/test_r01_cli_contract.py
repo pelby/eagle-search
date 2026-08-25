@@ -13,6 +13,7 @@ from pathlib import Path
 from src import db
 from src.cli import CliRuntime, build_parser, main
 from src.contracts import CaptionReceiptV1, CaptionResultV1
+from src.persistence.receipts import FileReceiptStore
 
 
 class FakeEmbedder:
@@ -58,6 +59,20 @@ class FakeCaptionProvider:
         return receipt
 
 
+class AmbiguousFirstNotesApi:
+    def __init__(self) -> None:
+        self.read_ids = []
+        self.update_ids = []
+
+    async def get_item(self, item_id):
+        self.read_ids.append(item_id)
+        return {"id": item_id, "annotation": "Human note", "lastModified": 1}
+
+    async def update_item(self, item_id, *, annotation=None, tags=None, source=None):
+        self.update_ids.append(item_id)
+        raise RuntimeError("uncertain transport outcome")
+
+
 class CliContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -78,12 +93,13 @@ class CliContractTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
-    def invoke(self, arguments, *, embedder=None, caption_provider=None):
+    def invoke(self, arguments, *, embedder=None, caption_provider=None, eagle=None):
         stdout = io.StringIO()
         stderr = io.StringIO()
         runtime = CliRuntime(
             home=self.home,
             embedder=embedder or FakeEmbedder(),
+            eagle=eagle,
             caption_provider=caption_provider,
         )
         with redirect_stdout(stdout), redirect_stderr(stderr):
@@ -150,6 +166,7 @@ class CliContractTests(unittest.TestCase):
                 "eval-report",
             }.issubset(subparsers.choices)
         )
+        self.assertEqual(parser.parse_args(["index"]).model, "gpt-5.6-sol")
 
     def test_eval_caption_stage_uses_private_resumable_journal(self) -> None:
         snapshot = self.home / "evals" / "fixture"
@@ -224,6 +241,67 @@ class CliContractTests(unittest.TestCase):
         )
         self.assertEqual(exit_code, 2)
         self.assertEqual(payload["error"]["code"], "invalid_request")
+
+    def test_notes_apply_stops_after_ambiguous_item_and_persists_private_journal(self) -> None:
+        store = FileReceiptStore(self.home / "captions")
+        connection = db.init_db(self.home / "db.sqlite")
+        for index, eagle_id in enumerate(("a-first", "b-second"), start=1):
+            image_hash = f"sha256:{index:064x}"
+            result = CaptionResultV1.from_dict(
+                {
+                    "contract_version": 1,
+                    "image_type": "illustration",
+                    "diagram_types": [],
+                    "subjects": ["robot"],
+                    "visual_style": [],
+                    "colours": [],
+                    "layout": [],
+                    "visible_text": [],
+                    "search_terms": ["teaching"],
+                    "summary": "A robot presents beside an easel.",
+                    "uncertainties": [],
+                }
+            )
+            receipt = CaptionReceiptV1.create(
+                image_hash=image_hash,
+                caption_result=result,
+                provider="fake",
+                model="fake",
+                effort="low",
+                prompt_version="caption-v2",
+                created_at="2026-08-25T22:00:00Z",
+            )
+            store.put_immutable(receipt)
+            store.set_active(image_hash, receipt.receipt_id, "test")
+            db.upsert_image(
+                connection,
+                {
+                    "eagle_id": eagle_id,
+                    "name": eagle_id,
+                    "image_hash": image_hash,
+                    "active_receipt_id": receipt.receipt_id,
+                },
+            )
+        connection.close()
+        api = AmbiguousFirstNotesApi()
+
+        exit_code, payload, _, _ = self.invoke(
+            ["notes-sync", "--apply", "--quiescent", "--json"],
+            eagle=api,
+        )
+
+        self.assertEqual(exit_code, 1)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["stopped_early"])
+        self.assertEqual(api.update_ids, ["a-first"])
+        self.assertEqual(api.read_ids.count("b-second"), 1)
+        journal = Path(payload["journal_path"])
+        self.assertTrue(journal.is_file())
+        persisted = json.loads(journal.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["state"], "stopped")
+        self.assertEqual(len(persisted["initial_snapshots"]), 2)
+        self.assertEqual(persisted["results"][0]["status"], "ambiguous")
+        self.assertEqual(persisted["results"][0]["before_annotation"], "Human note")
 
 
 if __name__ == "__main__":

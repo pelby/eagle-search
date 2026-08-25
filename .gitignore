@@ -20,6 +20,7 @@ raycast-extension/build/
 
 # Data (local, not committed)
 data/
+evidence/
 
 # Environment
 .env

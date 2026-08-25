@@ -6,6 +6,7 @@ Private, local-first visual search for an Eagle image library. Eagle Search desc
 
 - No Gemini, OpenRouter, provider key, or per-image API billing path.
 - Vision captions run through the locally logged-in `codex exec` session. Subscription usage limits still apply.
+- The default caption tier is `gpt-5.6-sol` at low effort.
 - Immutable caption receipts make SQLite a rebuildable projection rather than the only copy of a caption.
 - Search fuses weighted SQLite FTS5 and local Nomic text embeddings with reciprocal-rank fusion. It degrades to lexical search if Ollama is unavailable.
 - Original prompts embedded in image metadata are indexed directly. An embedded visual description skips the caption model.

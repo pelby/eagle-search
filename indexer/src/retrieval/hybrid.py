@@ -5,6 +5,7 @@ from __future__ import annotations
 from array import array
 from collections import defaultdict
 import sqlite3
+import re
 from typing import Sequence
 
 from .. import db
@@ -13,6 +14,34 @@ from .embeddings import Embedder, cosine_similarity
 
 RRF_K = 60
 SEMANTIC_FLOOR = 0.60
+_QUERY_PROFILES = {
+    "classroom": (
+        "presentation teaching easel",
+        "teaching illustration presentation scene art demonstration easel",
+    ),
+    "workshop": ("facilitation whiteboard sticky notes",),
+    "meeting": ("presentation conference team discussion",),
+    "diagram": ("flowchart schematic process model",),
+}
+
+
+def semantic_query_texts(query: str) -> tuple[str, ...]:
+    """Return bounded sense profiles for local semantic retrieval only."""
+
+    tokens = set(re.findall(r"\w+", query.casefold()))
+    base = query.strip()
+    variants = [base]
+    for token in sorted(tokens):
+        for profile in _QUERY_PROFILES.get(token, ()):
+            variants.append(" ".join((base, profile)).strip())
+    return tuple(dict.fromkeys(variant for variant in variants if variant))
+
+
+def semantic_query_text(query: str) -> str:
+    """Return the primary expansion for diagnostics and compatibility."""
+
+    variants = semantic_query_texts(query)
+    return variants[1] if len(variants) > 1 else (variants[0] if variants else "")
 
 
 def _rrf(rankings: Sequence[Sequence[str]]) -> dict[str, float]:
@@ -47,12 +76,20 @@ def hybrid_search(connection: sqlite3.Connection, query: str, embedder: Embedder
     lexical_ids = [str(row["eagle_id"]) for row in lexical_rows]
     row_by_id = {str(row["eagle_id"]): row for row in lexical_rows}
     try:
-        query_vector = embedder.embed([query])[0]
+        query_vectors = embedder.embed(list(semantic_query_texts(query)))
         semantic_scored: list[tuple[str, float]] = []
         for row in db.current_embeddings(connection, embedder.model):
             try:
                 vector = array("f"); vector.frombytes(row["vector"])
-                semantic_scored.append((str(row["eagle_id"]), cosine_similarity(query_vector, vector)))
+                semantic_scored.append(
+                    (
+                        str(row["eagle_id"]),
+                        max(
+                            cosine_similarity(query_vector, vector)
+                            for query_vector in query_vectors
+                        ),
+                    )
+                )
             except ValueError:
                 continue
         semantic_scored.sort(key=lambda item: (-item[1], item[0]))

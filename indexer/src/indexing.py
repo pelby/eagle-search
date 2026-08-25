@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import shutil
 import sqlite3
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from .captioning.codex_cli import (
     image_sha256,
 )
 from .contracts import CaptionReceiptV1, CaptionResultV1
+from .eagle_api import EagleApiError
 from .persistence.jobs import SQLiteCaptionJobStore
 from .persistence.receipts import FileReceiptStore, export_legacy_receipts
 from .retrieval.backfill import backfill_embeddings
@@ -58,12 +60,14 @@ class EmbeddedMetadata:
 class IndexOutcome:
     discovered: int
     updated: int
+    removed: int
     queued: int
     captioned: int
     failed: int
     embedded: int
     semantic_error: str = ""
     legacy_exported: int = 0
+    stale_cleanup_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {"contract_version": 1, "ok": self.failed == 0, **self.__dict__}
@@ -128,6 +132,46 @@ def preflight_legacy_export(database_path: Path, receipts_root: Path) -> dict[st
         return report
     finally:
         connection.close()
+
+
+def _legacy_receipt_refs(path: Path) -> dict[str, tuple[str, str]]:
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("legacy receipt manifest is unreadable") from error
+    if not isinstance(payload, dict) or payload.get("manifest_version") != 1:
+        raise RuntimeError("legacy receipt manifest version is unsupported")
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        raise RuntimeError("legacy receipt manifest entries are missing")
+    refs: dict[str, tuple[str, str]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or set(entry) != {"eagle_id", "image_hash", "receipt_id"}:
+            raise RuntimeError("legacy receipt manifest entry is malformed")
+        eagle_id = str(entry["eagle_id"])
+        if not eagle_id or eagle_id in refs:
+            raise RuntimeError("legacy receipt manifest Eagle IDs must be unique")
+        refs[eagle_id] = (str(entry["image_hash"]), str(entry["receipt_id"]))
+    return refs
+
+
+def _plan_stale_cleanup(
+    existing_ids: set[str],
+    current_ids: set[str],
+    *,
+    list_limit: int,
+) -> tuple[list[str], str]:
+    """Delete derived rows only when Eagle's capped list proves completeness."""
+
+    if not existing_ids:
+        return [], ""
+    if not current_ids:
+        return [], "Eagle returned no items; stale-row cleanup was skipped"
+    if len(current_ids) >= list_limit:
+        return [], f"Eagle returned the {list_limit}-item API limit; stale-row cleanup was skipped"
+    return sorted(existing_ids - current_ids), ""
 
 
 def _derive_image_path(thumbnail_path: Path, extension: str) -> Path:
@@ -205,7 +249,7 @@ async def index_library(
     eagle: EagleIndexApi,
     embedder: Embedder,
     caption_provider: CaptionProvider | None = None,
-    model: str = "gpt-5.6-luna",
+    model: str = "gpt-5.6-sol",
     effort: str = "low",
     max_items: int | None = None,
     metadata_reader: Callable[[Path], EmbeddedMetadata] = extract_embedded_metadata,
@@ -222,11 +266,13 @@ async def index_library(
     legacy = preflight_legacy_export(home / "db.sqlite", receipts_root)
     connection = db.init_db(home / "db.sqlite")
     receipt_store = FileReceiptStore(receipts_root)
+    legacy_refs = _legacy_receipt_refs(receipts_root / "legacy-manifest-v1.json")
     job_store = SQLiteCaptionJobStore(connection)
     thumbnails = home / "thumbnails"
     thumbnails.mkdir(parents=True, exist_ok=True)
     provider = caption_provider or CodexCliCaptionProvider()
-    items = await eagle.list_items(limit=10_000)
+    list_limit = 10_000
+    items = await eagle.list_items(limit=list_limit)
     folder_map = await eagle.get_folder_map()
     existing = {
         str(row["eagle_id"]): dict(row)
@@ -234,25 +280,62 @@ async def index_library(
     }
     selected = items[:max_items] if max_items is not None else items
     updated = 0
+    removed = 0
+    stale_cleanup_reason = ""
     queued = 0
 
     async def prepare(
         item: dict[str, Any],
-    ) -> tuple[dict[str, Any], Path, Path, EmbeddedMetadata] | None:
+    ) -> tuple[dict[str, Any], Path, Path, str, EmbeddedMetadata] | None:
         eagle_id = str(item["id"])
-        source_value = await eagle.get_thumbnail_path(eagle_id)
-        if not source_value:
-            return None
-        source = Path(source_value)
-        if not source.is_file():
-            return None
         destination = thumbnails / f"{eagle_id}.png"
-        shutil.copy2(source, destination)
-        original = _derive_image_path(source, str(item.get("ext", "png")))
-        metadata_path = original if original.is_file() and original != source else source
-        return item, source, destination, metadata_reader(metadata_path)
+        previous = existing.get(eagle_id, {})
+        source_mtime = int(item.get("mtime", 0) or 0)
+        source_size = int(item.get("size", 0) or 0)
+        previous_mtime = int(previous.get("source_mtime", 0) or 0)
+        previous_size = int(previous.get("source_size", 0) or 0)
+        fingerprint_missing = bool(previous) and bool(source_mtime or source_size) and not (
+            previous_mtime or previous_size
+        )
+        source_changed = bool(previous) and (
+            fingerprint_missing
+            or bool(previous_mtime and source_mtime and previous_mtime != source_mtime)
+            or bool(previous_size and source_size and previous_size != source_size)
+        )
+        if destination.is_file() and previous and not source_changed:
+            source = destination
+        else:
+            source_value: str | None = None
+            for attempt in range(3):
+                try:
+                    source_value = await eagle.get_thumbnail_path(eagle_id)
+                    break
+                except EagleApiError:
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(0.15 * (attempt + 1))
+            if not source_value:
+                return None
+            source = Path(source_value)
+            if not source.is_file():
+                return None
+            if source != destination:
+                shutil.copy2(source, destination)
+        digest = image_sha256(destination)
+        previous_hash = str(previous.get("image_hash", "") or "")
+        changed = bool(previous_hash) and previous_hash != digest
+        stored_image_path = str(previous.get("image_path", "") or "")
+        derived = _derive_image_path(source, str(item.get("ext", "png")))
+        image_path = Path(stored_image_path) if stored_image_path else derived
+        prior_description = str(previous.get("ai_description", "") or "")
+        should_read_metadata = changed or not prior_description
+        metadata_path = image_path if image_path.is_file() else source
+        metadata = metadata_reader(metadata_path) if should_read_metadata else EmbeddedMetadata()
+        return item, destination, image_path, digest, metadata
 
-    semaphore = asyncio.Semaphore(8)
+    # Eagle's desktop API is local but not designed for high request fan-out.
+    # Two readers keep discovery fast without destabilising its thumbnail route.
+    semaphore = asyncio.Semaphore(2)
 
     async def bounded(item: dict[str, Any]):
         async with semaphore:
@@ -262,30 +345,35 @@ async def index_library(
     for value in prepared:
         if value is None:
             continue
-        item, source_thumbnail, thumbnail, metadata = value
+        item, thumbnail, image_path, digest, metadata = value
         eagle_id = str(item["id"])
-        digest = image_sha256(thumbnail)
         previous = existing.get(eagle_id, {})
         prior_description = str(previous.get("ai_description", "") or "")
         folder_names = [folder_map.get(str(folder_id), "") for folder_id in item.get("folders", [])]
         changed = bool(previous.get("image_hash")) and previous.get("image_hash") != digest
         prior_caption_state = str(previous.get("caption_state", ""))
         caption_state = "pending" if changed else prior_caption_state or ("complete" if prior_description else "pending")
+        if changed:
+            with connection:
+                connection.execute(
+                    "DELETE FROM image_embeddings WHERE eagle_id=?",
+                    (eagle_id,),
+                )
         record = {
             "eagle_id": eagle_id,
             "name": str(item.get("name", "")),
             "tags": ", ".join(str(tag) for tag in item.get("tags", [])),
             "annotation": str(item.get("annotation", "")),
             "human_notes": str(item.get("annotation", "")),
-            "ai_description": prior_description or metadata.description,
-            "embedded_description": metadata.description or str(previous.get("embedded_description", "")),
-            "generation_prompt": metadata.prompt or str(previous.get("generation_prompt", "")),
-            "visual_caption": prior_description or metadata.description,
-            "visible_text": str(previous.get("visible_text", "")),
-            "visual_search_terms": str(previous.get("visual_search_terms", "")),
-            "visual_search_text": str(previous.get("visual_search_text", "")),
+            "ai_description": metadata.description if changed else prior_description or metadata.description,
+            "embedded_description": metadata.description if changed else metadata.description or str(previous.get("embedded_description", "")),
+            "generation_prompt": metadata.prompt if changed else metadata.prompt or str(previous.get("generation_prompt", "")),
+            "visual_caption": metadata.description if changed else prior_description or metadata.description,
+            "visible_text": "" if changed else str(previous.get("visible_text", "")),
+            "visual_search_terms": "" if changed else str(previous.get("visual_search_terms", "")),
+            "visual_search_text": "" if changed else str(previous.get("visual_search_text", "")),
             "thumbnail_path": str(thumbnail),
-            "image_path": str(_derive_image_path(source_thumbnail, str(item.get("ext", "png")))),
+            "image_path": str(image_path),
             "folder_name": ", ".join(name for name in folder_names if name),
             "ext": str(item.get("ext", "")),
             "width": int(item.get("width", 0) or 0),
@@ -293,17 +381,40 @@ async def index_library(
             "created_at": int(item.get("btime", 0) or 0),
             "image_hash": digest,
             "caption_state": caption_state,
-            "caption_attempts": int(previous.get("caption_attempts", 0) or 0),
-            "caption_last_error": str(previous.get("caption_last_error", "")),
-            "caption_updated_at": str(previous.get("caption_updated_at", "")),
-            "active_receipt_id": str(previous.get("active_receipt_id", "")),
-            "active_receipt_hash": str(previous.get("active_receipt_hash", "")),
+            "caption_attempts": 0 if changed else int(previous.get("caption_attempts", 0) or 0),
+            "caption_last_error": "" if changed else str(previous.get("caption_last_error", "")),
+            "caption_updated_at": "" if changed else str(previous.get("caption_updated_at", "")),
+            "active_receipt_id": "" if changed else str(previous.get("active_receipt_id", "")),
+            "active_receipt_hash": "" if changed else str(previous.get("active_receipt_hash", "")),
+            "source_mtime": int(item.get("mtime", 0) or 0),
+            "source_size": int(item.get("size", 0) or 0),
         }
         db.upsert_image(connection, record)
         updated += 1
         unchanged_legacy = not previous.get("image_hash") and bool(prior_description)
         needs_caption = changed or (not prior_description and caption_state != "complete")
-        if metadata.description and not prior_description:
+        if unchanged_legacy:
+            reference = legacy_refs.get(eagle_id)
+            if reference is None:
+                raise RuntimeError(f"legacy receipt manifest is missing Eagle item {eagle_id}")
+            legacy_receipt = receipt_store.get(*reference)
+            if legacy_receipt is None:
+                raise RuntimeError(f"legacy receipt is missing for Eagle item {eagle_id}")
+            adopted = CaptionReceiptV1.create(
+                image_hash=digest,
+                caption_result=legacy_receipt.caption_result,
+                provider=legacy_receipt.provider,
+                model=legacy_receipt.model,
+                effort=legacy_receipt.effort,
+                prompt_version=legacy_receipt.prompt_version,
+                created_at=legacy_receipt.created_at,
+                source="legacy",
+            )
+            receipt_store.put_immutable(adopted)
+            receipt_store.set_active(digest, adopted.receipt_id, "legacy receipt adopted to current image hash")
+            _project_receipt(connection, eagle_id, adopted)
+            needs_caption = False
+        if metadata.description and (changed or not prior_description):
             receipt = _embedded_receipt(image_hash=digest, description=metadata.description)
             receipt_store.put_immutable(receipt)
             receipt_store.set_active(digest, receipt.receipt_id, "embedded metadata")
@@ -312,6 +423,21 @@ async def index_library(
         if needs_caption and not unchanged_legacy:
             job_store.enqueue(eagle_id, digest, str(thumbnail))
             queued += 1
+
+    if max_items is None:
+        current_ids = {str(item["id"]) for item in items}
+        stale_ids, stale_cleanup_reason = _plan_stale_cleanup(
+            set(existing),
+            current_ids,
+            list_limit=list_limit,
+        )
+        if stale_ids:
+            with connection:
+                connection.executemany(
+                    "DELETE FROM images WHERE eagle_id=?",
+                    ((eagle_id,) for eagle_id in stale_ids),
+                )
+            removed = len(stale_ids)
 
     counts = job_store.counts()
     total = counts.get("pending", 0) + counts.get("failed", 0)
@@ -379,10 +505,12 @@ async def index_library(
     return IndexOutcome(
         discovered=len(items),
         updated=updated,
+        removed=removed,
         queued=queued,
         captioned=captioned,
         failed=failed,
         embedded=int(semantic["embedded"]),
         semantic_error=str(semantic["error"] or ""),
         legacy_exported=int(legacy["receipt_count"]),
+        stale_cleanup_reason=stale_cleanup_reason,
     )

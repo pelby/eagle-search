@@ -12,7 +12,7 @@ import sqlite3
 from typing import Any, Iterable, Sequence
 
 DB_PATH = Path.home() / ".eagle-search" / "db.sqlite"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 VECTOR_DIMENSIONS = 768
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 PHRASE_RE = re.compile(r'"([^"\n]+)"')
@@ -89,40 +89,41 @@ def _migration_two(connection: sqlite3.Connection) -> None:
 
 
 def _migration_three(connection: sqlite3.Connection) -> None:
-    connection.executescript(
+    statements = (
         """CREATE TABLE IF NOT EXISTS image_embeddings (
             eagle_id TEXT NOT NULL REFERENCES images(eagle_id) ON DELETE CASCADE,
             model TEXT NOT NULL, vector_kind TEXT NOT NULL, dimensions INTEGER NOT NULL,
             content_hash TEXT NOT NULL, vector BLOB NOT NULL, embedded_at TEXT NOT NULL,
             PRIMARY KEY(eagle_id, model, vector_kind)
-        );
-        CREATE TABLE IF NOT EXISTS caption_jobs (
+        )""",
+        """CREATE TABLE IF NOT EXISTS caption_jobs (
             eagle_id TEXT PRIMARY KEY REFERENCES images(eagle_id) ON DELETE CASCADE,
             image_hash TEXT NOT NULL, thumbnail_path TEXT NOT NULL, state TEXT NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0, claim_token TEXT DEFAULT '', claimed_at TEXT DEFAULT '',
             next_attempt_at TEXT DEFAULT '', last_error TEXT DEFAULT '', active_receipt_id TEXT DEFAULT '',
             updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS pending_imports (
+        )""",
+        """CREATE TABLE IF NOT EXISTS pending_imports (
             intent_id TEXT PRIMARY KEY, path TEXT NOT NULL UNIQUE, state TEXT NOT NULL,
             eagle_id TEXT DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0, claim_token TEXT DEFAULT '',
             claimed_at TEXT DEFAULT '', updated_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS index_runs (
+        )""",
+        """CREATE TABLE IF NOT EXISTS index_runs (
             run_id TEXT PRIMARY KEY, state TEXT NOT NULL, stage TEXT NOT NULL,
             started_at TEXT NOT NULL, finished_at TEXT DEFAULT '', details_json TEXT DEFAULT ''
-        );
-        CREATE TABLE IF NOT EXISTS search_feedback (
+        )""",
+        """CREATE TABLE IF NOT EXISTS search_feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT, query_text TEXT NOT NULL, retrieval_mode TEXT NOT NULL,
             returned_ids_json TEXT NOT NULL, selected_eagle_id TEXT DEFAULT '',
             no_result INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
-        );
-        CREATE INDEX IF NOT EXISTS image_embeddings_lookup ON image_embeddings(model, vector_kind, content_hash);
-        CREATE INDEX IF NOT EXISTS caption_jobs_claim ON caption_jobs(state, next_attempt_at, updated_at);
-        CREATE INDEX IF NOT EXISTS pending_imports_claim ON pending_imports(state, updated_at);
-        CREATE INDEX IF NOT EXISTS search_feedback_retention ON search_feedback(created_at);
-        """
+        )""",
+        "CREATE INDEX IF NOT EXISTS image_embeddings_lookup ON image_embeddings(model, vector_kind, content_hash)",
+        "CREATE INDEX IF NOT EXISTS caption_jobs_claim ON caption_jobs(state, next_attempt_at, updated_at)",
+        "CREATE INDEX IF NOT EXISTS pending_imports_claim ON pending_imports(state, updated_at)",
+        "CREATE INDEX IF NOT EXISTS search_feedback_retention ON search_feedback(created_at)",
     )
+    for statement in statements:
+        connection.execute(statement)
 
 
 def _migration_four(connection: sqlite3.Connection) -> None:
@@ -131,7 +132,18 @@ def _migration_four(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE pending_imports ADD COLUMN last_error TEXT DEFAULT ''")
 
 
-_MIGRATIONS = {1: _migration_one, 2: _migration_two, 3: _migration_three, 4: _migration_four}
+def _migration_five(connection: sqlite3.Connection) -> None:
+    _add_column(connection, "source_mtime", "INTEGER NOT NULL DEFAULT 0")
+    _add_column(connection, "source_size", "INTEGER NOT NULL DEFAULT 0")
+
+
+_MIGRATIONS = {
+    1: _migration_one,
+    2: _migration_two,
+    3: _migration_three,
+    4: _migration_four,
+    5: _migration_five,
+}
 
 
 def _migrate(connection: sqlite3.Connection) -> None:
@@ -201,6 +213,8 @@ def upsert_image(connection: sqlite3.Connection, data: dict[str, Any]) -> None:
         "caption_attempts": int(data.get("caption_attempts", 0) or 0), "caption_last_error": _string(data, "caption_last_error"),
         "caption_updated_at": _string(data, "caption_updated_at"), "active_receipt_id": _string(data, "active_receipt_id"),
         "active_receipt_hash": _string(data, "active_receipt_hash"),
+        "source_mtime": int(data.get("source_mtime", 0) or 0),
+        "source_size": int(data.get("source_size", 0) or 0),
     }
     columns = ", ".join(values)
     placeholders = ", ".join(f":{key}" for key in values)
