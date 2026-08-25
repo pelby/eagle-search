@@ -1,7 +1,8 @@
-import { Action, ActionPanel, Icon, List } from "@raycast/api";
-import { useState, useEffect } from "react";
-import { searchImages, getAllImages, type ImageResult } from "./lib/db";
+import { Action, ActionPanel, getPreferenceValues, Icon, List } from "@raycast/api";
+import { useEffect, useState } from "react";
 import { revealInFinder } from "./lib/eagle";
+import { createIndexerClient, IndexerClientError, type SearchResultV1 } from "./lib/indexer";
+import { runUv } from "./lib/process";
 import { homedir } from "os";
 import { resolve } from "path";
 
@@ -14,7 +15,7 @@ function formatDimensions(w: number, h: number): string {
   return `${w}×${h}`;
 }
 
-function buildDetailMarkdown(item: ImageResult, thumbPath: string, dims: string): string {
+function buildDetailMarkdown(item: SearchResultV1, thumbPath: string, dims: string): string {
   const parts: string[] = [];
 
   // Image takes full width at the top
@@ -44,38 +45,39 @@ function buildDetailMarkdown(item: ImageResult, thumbPath: string, dims: string)
 
 export default function SearchEagleImages() {
   const [searchText, setSearchText] = useState("");
-  const [results, setResults] = useState<ImageResult[]>([]);
+  const [results, setResults] = useState<SearchResultV1[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const indexerPath = expandPath(getPreferenceValues<{ indexerPath?: string }>().indexerPath || "");
 
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
     setIsLoading(true);
+    setError(null);
 
     const timer = setTimeout(async () => {
       try {
-        const items = searchText.trim()
-          ? await searchImages(searchText)
-          : await getAllImages();
-        if (!cancelled) {
-          setResults(items);
-        }
+        const client = createIndexerClient({ indexerPath, run: runUv });
+        const response = await client.search(searchText, 30, controller.signal);
+        if (controller.signal.aborted) return;
+        setResults(response.results);
+        setWarnings(response.retrieval.semantic_available ? [] : response.retrieval.warnings);
       } catch (err) {
-        console.error("Search error:", err);
-        if (!cancelled) {
-          setResults([]);
-        }
+        if (controller.signal.aborted) return;
+        setResults([]);
+        setWarnings([]);
+        setError(err instanceof IndexerClientError ? err.message : "Eagle Search is unavailable");
       } finally {
-        if (!cancelled) {
-          setIsLoading(false);
-        }
+        if (!controller.signal.aborted) setIsLoading(false);
       }
-    }, 200); // debounce
+    }, 200);
 
     return () => {
-      cancelled = true;
       clearTimeout(timer);
+      controller.abort();
     };
-  }, [searchText]);
+  }, [indexerPath, searchText]);
 
   return (
     <List
@@ -87,13 +89,18 @@ export default function SearchEagleImages() {
       searchBarPlaceholder="Search by concept, style, content..."
       navigationTitle={`Eagle Search${results.length > 0 ? ` (${results.length})` : ""}`}
     >
-      {results.length === 0 && !isLoading ? (
+      {warnings.map((warning) => (
+        <List.Item key={`warning:${warning}`} title="Semantic search unavailable" subtitle={warning} icon={Icon.ExclamationMark} />
+      ))}
+      {error ? (
+        <List.EmptyView title="Eagle Search unavailable" description={error} icon={Icon.ExclamationMark} />
+      ) : results.length === 0 && !isLoading ? (
         <List.EmptyView
           title="No images found"
           description={
             searchText
               ? "Try different search terms"
-              : "Run the indexer first: uv run python -m src index"
+              : "Run ‘Index New Eagle Images’ to start the indexer"
           }
           icon={Icon.MagnifyingGlass}
         />
@@ -101,7 +108,7 @@ export default function SearchEagleImages() {
         results.map((item) => {
           const thumbPath = expandPath(item.thumbnail_path);
           const imagePath = expandPath(item.image_path);
-          const dims = formatDimensions(item.width, item.height);
+          const dims = formatDimensions(item.width || 0, item.height || 0);
 
           return (
             <List.Item
