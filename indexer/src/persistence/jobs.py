@@ -89,7 +89,7 @@ class SQLiteImportQueueStore:
             row = self.connection.execute("SELECT * FROM pending_imports WHERE path=?", (path,)).fetchone()
         if row is None:
             raise RuntimeError("import intent disappeared")
-        return ImportIntent(intent_id, str(row["path"]), str(row["state"]), str(row["eagle_id"]), int(row["attempts"]))
+        return ImportIntent(str(row["intent_id"]), str(row["path"]), str(row["state"]), str(row["eagle_id"]), int(row["attempts"]))
 
     def claim(self, *, worker_id: str) -> ImportIntent | None:
         token = f"{worker_id}:{uuid4()}"
@@ -100,10 +100,32 @@ class SQLiteImportQueueStore:
             self.connection.execute("UPDATE pending_imports SET state='claimed',claim_token=?,attempts=attempts+1,claimed_at=?,updated_at=? WHERE intent_id=?", (token, _iso(), _iso(), row["intent_id"]))
         return ImportIntent(str(row["intent_id"]), str(row["path"]), "claimed", str(row["eagle_id"]), int(row["attempts"]) + 1)
 
+    def release(self, intent_id: str, error: str = "") -> None:
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE pending_imports SET state='pending',claim_token='',claimed_at='',last_error=?,updated_at=? "
+                "WHERE intent_id=? AND state='claimed'",
+                (error[:500], _iso(), intent_id),
+            )
+        if cursor.rowcount != 1:
+            raise ValueError("import intent is not currently claimed")
+
+    def release_stale(self, *, older_than_seconds: int) -> int:
+        if older_than_seconds < 0:
+            raise ValueError("older_than_seconds cannot be negative")
+        cutoff = _iso(_now() - timedelta(seconds=older_than_seconds))
+        with self.connection:
+            cursor = self.connection.execute(
+                "UPDATE pending_imports SET state='pending',claim_token='',claimed_at='',"
+                "last_error='stale claim released',updated_at=? WHERE state='claimed' AND claimed_at<?",
+                (_iso(), cutoff),
+            )
+        return int(cursor.rowcount)
+
     def reconcile(self, intent_id: str, eagle_id: str) -> None:
         with self.connection:
-            self.connection.execute("UPDATE pending_imports SET state='reconciled',eagle_id=?,claim_token='',updated_at=? WHERE intent_id=?", (eagle_id, _iso(), intent_id))
+            self.connection.execute("UPDATE pending_imports SET state='reconciled',eagle_id=?,claim_token='',last_error='',updated_at=? WHERE intent_id=?", (eagle_id, _iso(), intent_id))
 
     def acknowledge(self, intent_id: str, eagle_id: str) -> None:
         with self.connection:
-            self.connection.execute("UPDATE pending_imports SET state='complete',eagle_id=?,claim_token='',updated_at=? WHERE intent_id=?", (eagle_id, _iso(), intent_id))
+            self.connection.execute("UPDATE pending_imports SET state='complete',eagle_id=?,claim_token='',last_error='',updated_at=? WHERE intent_id=?", (eagle_id, _iso(), intent_id))

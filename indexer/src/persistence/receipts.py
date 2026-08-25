@@ -112,11 +112,20 @@ def _legacy_hash(row: sqlite3.Row) -> str:
 
 def export_legacy_receipts(connection: sqlite3.Connection, store: FileReceiptStore) -> dict[str, int]:
     """Export every nonblank v1 description before declaring SQLite disposable."""
+    columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(images)").fetchall()
+    }
+    if not {"eagle_id", "thumbnail_path", "ai_description", "indexed_at"}.issubset(columns):
+        raise RuntimeError("legacy images table is missing required export columns")
+    image_hash_projection = "image_hash" if "image_hash" in columns else "'' AS image_hash"
     rows = connection.execute(
-        "SELECT eagle_id, thumbnail_path, ai_description, indexed_at, image_hash FROM images WHERE ai_description <> '' ORDER BY eagle_id"
+        f"SELECT eagle_id, thumbnail_path, ai_description, indexed_at, {image_hash_projection} "
+        "FROM images WHERE ai_description <> '' ORDER BY eagle_id"
     ).fetchall()
     ids: set[str] = set()
     receipt_ids: set[str] = set()
+    entries: list[dict[str, str]] = []
     for row in rows:
         text = str(row["ai_description"])
         caption = CaptionResultV1.from_dict({
@@ -131,9 +140,20 @@ def export_legacy_receipts(connection: sqlite3.Connection, store: FileReceiptSto
         )
         store.put_immutable(receipt)
         store.set_active(receipt.image_hash, receipt.receipt_id, "legacy export")
-        ids.add(str(row["eagle_id"])); receipt_ids.add(receipt.receipt_id)
+        eagle_id = str(row["eagle_id"])
+        ids.add(eagle_id); receipt_ids.add(receipt.receipt_id)
+        entries.append(
+            {
+                "eagle_id": eagle_id,
+                "image_hash": receipt.image_hash,
+                "receipt_id": receipt.receipt_id,
+            }
+        )
     report = {"source_rows": len(rows), "distinct_eagle_ids": len(ids), "receipt_count": len(receipt_ids)}
     if len(rows) != len(ids) or len(ids) != len(receipt_ids):
         raise RuntimeError("legacy receipt export count mismatch")
-    _atomic_json(store.root / "legacy-manifest-v1.json", report)
+    _atomic_json(
+        store.root / "legacy-manifest-v1.json",
+        {"manifest_version": 1, **report, "entries": entries},
+    )
     return report

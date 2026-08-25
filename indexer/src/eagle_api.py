@@ -101,10 +101,17 @@ class EagleApiClient:
 
     async def is_running(self) -> bool:
         try:
-            await self._request("GET", "/api/application/info")
+            await self.application_info()
             return True
         except EagleApiError:
             return False
+
+    async def application_info(self) -> dict[str, Any]:
+        payload = await self._request("GET", "/api/application/info")
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("version"), str):
+            raise EagleProtocolError("Eagle application/info data is not an application object")
+        return dict(data)
 
     async def get_item(self, item_id: str) -> dict[str, Any]:
         if not item_id:

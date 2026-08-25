@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from ..eagle_api import EagleAmbiguousCommitError
+from ..eagle_api import EagleAmbiguousCommitError, EagleApiError
 from ..ports import ImportIntent, ImportQueueStore
 from .notes import import_intent_marker, render_generation_block
 
@@ -305,15 +305,21 @@ class GeneratedImageImporter:
             return ImportOutcome("idle")
         metadata = self.metadata_store.get(intent.intent_id)
         if metadata is None:
+            self.queue.release(intent.intent_id, "durable import metadata is missing")
             return ImportOutcome("blocked", intent.intent_id, error="durable import metadata is missing")
 
-        existing = await self._find_by_marker(intent.intent_id)
+        try:
+            existing = await self._find_by_marker(intent.intent_id)
+        except EagleApiError as exc:
+            self.queue.release(intent.intent_id, str(exc))
+            return ImportOutcome("paused", intent.intent_id, error=str(exc)[:500])
         if existing:
             if not await self._verify_marker(existing, intent.intent_id):
                 return ImportOutcome("ambiguous", intent.intent_id, existing, "marker read-back failed")
             return self._acknowledge(intent.intent_id, existing, reconciled=True)
 
         if metadata.add_attempted:
+            self.queue.release(intent.intent_id, "prior add outcome remains unresolved")
             return ImportOutcome(
                 "ambiguous",
                 intent.intent_id,
@@ -336,15 +342,21 @@ class GeneratedImageImporter:
                 tags=metadata.tags,
             )
         except EagleAmbiguousCommitError as exc:
-            existing = await self._find_by_marker(intent.intent_id)
+            try:
+                existing = await self._find_by_marker(intent.intent_id)
+            except EagleApiError:
+                existing = ""
             if existing and await self._verify_marker(existing, intent.intent_id):
                 return self._acknowledge(intent.intent_id, existing, reconciled=True)
+            self.queue.release(intent.intent_id, str(exc))
             return ImportOutcome("ambiguous", intent.intent_id, error=str(exc))
         except Exception as exc:
             self.metadata_store.set_attempted(intent.intent_id, False)
+            self.queue.release(intent.intent_id, str(exc))
             return ImportOutcome("failed", intent.intent_id, error=str(exc)[:500])
 
         if not await self._verify_marker(eagle_id, intent.intent_id):
+            self.queue.release(intent.intent_id, "returned Eagle ID did not preserve the import marker")
             return ImportOutcome(
                 "ambiguous",
                 intent.intent_id,

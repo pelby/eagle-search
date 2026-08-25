@@ -106,7 +106,9 @@ class CaptionResultV1:
             raise ContractError("visible_text must contain at most 40 entries")
         visible = tuple(VisibleTextV1.from_dict(entry) for entry in raw_visible)
         image_type = _string(payload["image_type"], "image_type", max_length=100)
-        summary = _string(payload["summary"], "summary", max_length=1_000)
+        # Model output is constrained more tightly by its response schema, while
+        # the durable contract must also losslessly carry longer legacy captions.
+        summary = _string(payload["summary"], "summary", max_length=20_000)
         if not image_type.strip() or not summary.strip():
             raise ContractError("image_type and summary cannot be blank")
         return cls(

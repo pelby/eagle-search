@@ -91,8 +91,8 @@ def named_mutants() -> tuple[Mutant, ...]:
         Mutant(
             "disconnect-raycast-from-canonical-cli",
             "raycast-extension/src/lib/indexer.ts",
-            '  return ["run", "python", "-m", "src", "search", query, "--mode", mode, "--limit", String(limit), "--json"];\n',
-            '  return ["run", "python", "-m", "src", "legacy-search", query, "--mode", mode, "--limit", String(limit), "--json"]; // MUTANT\n',
+            '    "search",\n    query,\n',
+            '    "legacy-search", // MUTANT\n    query,\n',
             "tests.test_composed_journeys.RaycastClientJourneyTests.test_raycast_search_client_invokes_canonical_cli",
         ),
     )
@@ -182,4 +182,3 @@ class MutationHarness:
 
     def run_all(self) -> tuple[MutationResult, ...]:
         return tuple(self.run(mutant) for mutant in named_mutants())
-

@@ -12,7 +12,7 @@ import sqlite3
 from typing import Any, Iterable, Sequence
 
 DB_PATH = Path.home() / ".eagle-search" / "db.sqlite"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 VECTOR_DIMENSIONS = 768
 TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 PHRASE_RE = re.compile(r'"([^"\n]+)"')
@@ -125,7 +125,13 @@ def _migration_three(connection: sqlite3.Connection) -> None:
     )
 
 
-_MIGRATIONS = {1: _migration_one, 2: _migration_two, 3: _migration_three}
+def _migration_four(connection: sqlite3.Connection) -> None:
+    columns = _columns(connection, "pending_imports")
+    if "last_error" not in columns:
+        connection.execute("ALTER TABLE pending_imports ADD COLUMN last_error TEXT DEFAULT ''")
+
+
+_MIGRATIONS = {1: _migration_one, 2: _migration_two, 3: _migration_three, 4: _migration_four}
 
 
 def _migrate(connection: sqlite3.Connection) -> None:

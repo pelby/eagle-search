@@ -15,7 +15,7 @@ from src.eagle.importer import (
     file_is_stable,
 )
 from src.eagle.notes import import_intent_marker
-from src.eagle_api import EagleApiClient, EagleAmbiguousCommitError, EagleProtocolError
+from src.eagle_api import EagleApiClient, EagleAmbiguousCommitError, EagleApiError, EagleProtocolError
 from src.ports import ImportIntent
 
 
@@ -46,6 +46,7 @@ class FakeImportQueue:
         self.claim_order: list[str] = []
         self.reconciled: list[tuple[str, str]] = []
         self.acknowledged: list[tuple[str, str]] = []
+        self.released: list[tuple[str, str]] = []
 
     def enqueue(self, path: str, intent_id: str) -> ImportIntent:
         intent = self.intents.get(intent_id)
@@ -61,6 +62,12 @@ class FakeImportQueue:
         intent_id = self.claim_order[0]
         intent = self.intents[intent_id]
         return replace(intent, state="claimed", attempts=intent.attempts + 1)
+
+    def release(self, intent_id: str, error: str = "") -> None:
+        self.released.append((intent_id, error))
+
+    def release_stale(self, *, older_than_seconds: int) -> int:
+        return 0
 
     def reconcile(self, intent_id: str, eagle_id: str) -> None:
         self.reconciled.append((intent_id, eagle_id))
@@ -79,8 +86,12 @@ class FakeEagle:
         self.timeout_after_commit = False
         self.hide_marker_scans = 0
         self.corrupt_readback = False
+        self.unavailable_scans = 0
 
     async def list_recent(self, *, limit: int = 200) -> list[dict]:
+        if self.unavailable_scans > 0:
+            self.unavailable_scans -= 1
+            raise EagleApiError("Eagle unavailable")
         if self.hide_marker_scans > 0:
             self.hide_marker_scans -= 1
             return []
@@ -206,6 +217,19 @@ class ImporterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.eagle.add_calls, [])
         self.assertEqual(self.queue.acknowledged, [(intent.intent_id, "already-there")])
 
+    async def test_eagle_unavailable_releases_claim_then_recovers_once(self) -> None:
+        importer = self.importer()
+        intent = importer.enqueue(self.image, prompt="Prompt", source="generator", tags=())
+        self.eagle.unavailable_scans = 1
+
+        paused = await importer.process_one()
+        recovered = await importer.process_one()
+
+        self.assertEqual(paused.state, "paused")
+        self.assertEqual(self.queue.released[0][0], intent.intent_id)
+        self.assertEqual(recovered.state, "imported")
+        self.assertEqual(len(self.eagle.add_calls), 1)
+
     async def test_overlapping_import_authority_refuses_before_queue_or_eagle(self) -> None:
         importer = self.importer(overlapping_authority=True)
 
@@ -246,6 +270,16 @@ class ImporterTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EagleApiContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_application_info_validates_versioned_object(self) -> None:
+        async def handler(_method: str, _url: str, _kwargs) -> FakeHttpResponse:
+            return FakeHttpResponse(
+                {"status": "success", "data": {"version": "4.0.0", "preferences": {}}}
+            )
+
+        info = await EagleApiClient(http_client=FakeHttpClient(handler)).application_info()
+
+        self.assertEqual(info["version"], "4.0.0")
+
     async def test_get_item_and_add_from_path_validate_success_shapes(self) -> None:
         async def handler(_method: str, url: str, _kwargs) -> FakeHttpResponse:
             if url.endswith("/api/item/info"):
