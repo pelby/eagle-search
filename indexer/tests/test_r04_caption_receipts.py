@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
+import stat
 from pathlib import Path
 
 from src.contracts import CaptionReceiptV1, CaptionResultV1
@@ -25,6 +27,27 @@ def receipt(*, model: str = "luna", prompt: str = "v1") -> CaptionReceiptV1:
 
 
 class ReceiptStoreTests(unittest.TestCase):
+    def test_existing_receipt_directories_are_hardened_owner_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "receipts"
+            item = receipt()
+            item_directory = root / item.image_hash
+            item_directory.mkdir(parents=True)
+            os.chmod(root, 0o755)
+            os.chmod(item_directory, 0o755)
+
+            store = FileReceiptStore(root)
+            store.put_immutable(item)
+            store.set_active(item.image_hash, item.receipt_id, "accepted")
+
+            self.assertEqual(stat.S_IMODE(root.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(item_directory.stat().st_mode), 0o700)
+            self.assertEqual(
+                stat.S_IMODE((item_directory / f"{item.receipt_id}.json").stat().st_mode),
+                0o600,
+            )
+            self.assertEqual(stat.S_IMODE((item_directory / "active.json").stat().st_mode), 0o600)
+
     def test_receipts_are_immutable_and_active_pointer_recovers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = FileReceiptStore(Path(directory))

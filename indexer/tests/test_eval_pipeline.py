@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from dataclasses import replace
 
 from evals.fixture_builder import (
     build_private_manifest,
@@ -40,13 +41,14 @@ def aggregate(model: str, *, critical: int = 0, lower: float = -0.01) -> Candida
         ndcg_at_10=0.90,
         recall_at_10=0.94,
         known_query_passed=True,
+        background_throughput_accepted=False,
         lower_bounds={"ndcg_at_10": lower, "recall_at_10": lower, "concept_f1": lower, "ocr_character_f1": lower},
         lanes={
             "bm25": {"ndcg_at_10": 0.88, "recall_at_10": 0.92, "mrr": 0.8},
             "nomic": {"ndcg_at_10": 0.86, "recall_at_10": 0.91, "mrr": 0.77},
             "rrf": {"ndcg_at_10": 0.90, "recall_at_10": 0.94, "mrr": 0.82},
         },
-        latencies_seconds=(1.3, 1.6, 2.2),
+        latencies_seconds=tuple([1.3, 1.6, 2.2] * 14),
     )
 
 
@@ -85,8 +87,80 @@ class FixtureBuilderTests(unittest.TestCase):
         self.assertNotIn("image_path", anonymous)
         self.assertNotIn("image_hash", anonymous)
 
+    def test_required_targets_are_included_once_and_count_toward_stratum_quota(self) -> None:
+        anchored = candidates()
+        b_anchor = anchored[0]
+        b_anchor.update({"required_stage": "B", "required_role": "target"})
+        c_anchor = anchored[70]
+        c_anchor.update({"required_stage": "C", "required_role": "target"})
+
+        manifest = build_private_manifest(
+            anchored,
+            snapshot_id="anchored",
+            seed=71,
+            sealing_inputs={
+                "labels_hash": "labels",
+                "gates_hash": "gates",
+                "amendment_hash": "amendment",
+                "instrument_version": "selection-instrument-v1",
+                "target_count": 60,
+            },
+        )
+        fixtures = manifest["fixtures"]
+
+        for anchor, stage in ((b_anchor, "B"), (c_anchor, "C")):
+            matches = [fixture for fixture in fixtures if fixture["image_hash"] == anchor["image_hash"]]
+            self.assertEqual(len(matches), 1)
+            self.assertEqual((matches[0]["stage"], matches[0]["role"]), (stage, "target"))
+            self.assertEqual(
+                set(matches[0]),
+                {"fixture_id", "image_hash", "image_path", "stratum", "stage", "role"},
+            )
+
+        b_diagrams = [
+            fixture
+            for fixture in fixtures
+            if fixture["stage"] == "B" and fixture["role"] == "target" and fixture["stratum"] == "diagram"
+        ]
+        self.assertEqual(len(b_diagrams), 5)
+
+    def test_required_target_validation_rejects_partial_invalid_or_over_quota_anchors(self) -> None:
+        seal = {
+            "labels_hash": "labels",
+            "gates_hash": "gates",
+            "amendment_hash": "amendment",
+            "instrument_version": "selection-instrument-v1",
+            "target_count": 60,
+        }
+        malformed = (
+            {"required_stage": "B"},
+            {"required_stage": "A", "required_role": "target"},
+            {"required_stage": "B", "required_role": "distractor"},
+            {"required_stage": "B", "required_role": "target", "query_text": "must not enter the manifest"},
+        )
+        for extra in malformed:
+            with self.subTest(extra=extra):
+                records = candidates()
+                records[0].update(extra)
+                with self.assertRaises(ValueError):
+                    build_private_manifest(records, snapshot_id="bad-anchor", seed=7, sealing_inputs=seal)
+
+        over_quota = candidates()
+        for record in over_quota[:6]:
+            record.update({"required_stage": "B", "required_role": "target"})
+        with self.assertRaisesRegex(ValueError, "quota"):
+            build_private_manifest(over_quota, snapshot_id="too-many-anchors", seed=7, sealing_inputs=seal)
+
 
 class AggregateReportTests(unittest.TestCase):
+    def test_latency_gate_requires_42_caption_window_or_explicit_background_evidence(self) -> None:
+        slow = replace(aggregate("gpt-5.6-luna"), latencies_seconds=(30.0,) * 42)
+        documented = replace(slow, background_throughput_accepted=True)
+
+        self.assertIn("latency", slow.absolute_failures())
+        self.assertNotIn("latency", documented.absolute_failures())
+        self.assertEqual(slow.projected_caption_window_seconds(), 1260.0)
+
     def test_lowest_passing_tier_wins_and_report_keeps_lane_and_latency_metrics(self) -> None:
         result = decide_winner([aggregate("gpt-5.6-luna"), aggregate("gpt-5.6-terra")], comparator="gpt-5.6-terra")
 
@@ -95,6 +169,11 @@ class AggregateReportTests(unittest.TestCase):
         report = json.dumps(render_anonymised_report(result))
         self.assertIn("bm25", report)
         self.assertIn("p95_latency_seconds", report)
+        self.assertIn('"concept_precision": 0.97', report)
+        self.assertIn('"concept_f1": 0.93', report)
+        self.assertIn('"ocr_character_f1": 0.94', report)
+        self.assertIn('"schema_valid_rate": 1.0', report)
+        self.assertIn('"known_query_passed": true', report)
         self.assertNotIn("cost", report.casefold())
 
     def test_critical_failure_is_never_selected_and_inconclusive_uses_stronger_comparator(self) -> None:

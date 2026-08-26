@@ -17,6 +17,7 @@ from .runner import seal_hidden_manifest
 
 _HASH_RE = re.compile(r"^sha256:[a-f0-9]{64}$")
 _CANDIDATE_KEYS = {"image_hash", "image_path", "stratum"}
+_REQUIRED_KEYS = {"required_stage", "required_role"}
 _STAGE_SHAPES = {
     ("A", "target"): 6,
     ("B", "target"): 24,
@@ -27,8 +28,12 @@ _STAGE_SHAPES = {
 
 
 def _require_candidate(record: Mapping[str, Any]) -> dict[str, str]:
-    if set(record) != _CANDIDATE_KEYS:
-        raise ValueError("fixture candidates may contain only image_hash, image_path and stratum")
+    keys = set(record)
+    if keys not in (_CANDIDATE_KEYS, _CANDIDATE_KEYS | _REQUIRED_KEYS):
+        raise ValueError(
+            "fixture candidates may contain image_hash, image_path and stratum, "
+            "plus a complete required_stage/required_role anchor"
+        )
     image_hash = record["image_hash"]
     image_path = record["image_path"]
     stratum = record["stratum"]
@@ -36,7 +41,19 @@ def _require_candidate(record: Mapping[str, Any]) -> dict[str, str]:
         raise ValueError("fixture candidate image_hash must be a sha256 digest")
     if not isinstance(image_path, str) or not image_path.strip() or not isinstance(stratum, str) or not stratum.strip():
         raise ValueError("fixture candidate image_path and stratum must be nonblank strings")
-    return {"image_hash": image_hash, "image_path": image_path, "stratum": stratum}
+    normalised = {"image_hash": image_hash, "image_path": image_path, "stratum": stratum}
+    if _REQUIRED_KEYS.issubset(keys):
+        required_stage = record["required_stage"]
+        required_role = record["required_role"]
+        if (
+            not isinstance(required_stage, str)
+            or not isinstance(required_role, str)
+            or required_stage not in {"B", "C"}
+            or required_role != "target"
+        ):
+            raise ValueError("required candidates must be B or C targets")
+        normalised.update({"required_stage": required_stage, "required_role": required_role})
+    return normalised
 
 
 def _balanced_counts(count: int, strata: Sequence[str]) -> dict[str, int]:
@@ -47,16 +64,25 @@ def _balanced_counts(count: int, strata: Sequence[str]) -> dict[str, int]:
 
 
 def _take_stratified(
-    pools: Mapping[str, list[dict[str, str]]], *, count: int, rng: random.Random
+    pools: Mapping[str, list[dict[str, str]]],
+    *,
+    count: int,
+    rng: random.Random,
+    required: Sequence[dict[str, str]] = (),
 ) -> list[dict[str, str]]:
     strata = sorted(pools)
     wanted = _balanced_counts(count, strata)
-    selected: list[dict[str, str]] = []
+    required_counts = Counter(candidate["stratum"] for candidate in required)
+    for stratum, required_count in required_counts.items():
+        if stratum not in wanted or required_count > wanted[stratum]:
+            raise ValueError(f"required target candidates exceed the balanced quota for stratum {stratum!r}")
+    selected = list(required)
     for stratum in strata:
         pool = pools[stratum]
-        if len(pool) < wanted[stratum]:
+        sample_count = wanted[stratum] - required_counts[stratum]
+        if len(pool) < sample_count:
             raise ValueError(f"insufficient candidates in stratum {stratum!r} for a balanced frozen fixture")
-        selected.extend(pool.pop() for _ in range(wanted[stratum]))
+        selected.extend(pool.pop() for _ in range(sample_count))
     rng.shuffle(selected)
     return selected
 
@@ -102,18 +128,28 @@ def build_private_manifest(
     normalised = [_require_candidate(candidate) for candidate in candidates]
     if len({candidate["image_hash"] for candidate in normalised}) != len(normalised):
         raise ValueError("fixture candidates must have unique content hashes")
-    pools: dict[str, list[dict[str, str]]] = defaultdict(list)
-    for candidate in sorted(normalised, key=lambda item: (item["stratum"], item["image_hash"])):
-        pools[candidate["stratum"]].append(candidate)
-    if len(pools) < 5:
+    strata = sorted({candidate["stratum"] for candidate in normalised})
+    if len(strata) < 5:
         raise ValueError("private fixture requires at least five visual strata")
+    pools: dict[str, list[dict[str, str]]] = {stratum: [] for stratum in strata}
+    required: dict[tuple[str, str], list[dict[str, str]]] = defaultdict(list)
+    for candidate in sorted(normalised, key=lambda item: (item["stratum"], item["image_hash"])):
+        if "required_stage" in candidate:
+            required[(candidate["required_stage"], candidate["required_role"])].append(candidate)
+        else:
+            pools[candidate["stratum"]].append(candidate)
     rng = random.Random(seed)
     for pool in pools.values():
         rng.shuffle(pool)
     fixtures: list[dict[str, str]] = []
     fixture_number = 1
     for (stage, role), count in _STAGE_SHAPES.items():
-        for candidate in _take_stratified(pools, count=count, rng=rng):
+        for candidate in _take_stratified(
+            pools,
+            count=count,
+            rng=rng,
+            required=required.get((stage, role), ()),
+        ):
             fixtures.append(
                 {
                     "fixture_id": f"f-{fixture_number:04d}",

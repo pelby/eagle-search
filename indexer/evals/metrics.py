@@ -122,16 +122,19 @@ def cluster_bootstrap_lower_bound(
     A target image, not each of its queries, is the resampling unit.
     """
 
-    clusters = sorted(set(candidate).intersection(comparator))
-    if not clusters or resamples <= 0:
+    candidate_clusters = set(candidate)
+    comparator_clusters = set(comparator)
+    if not candidate_clusters or resamples <= 0:
         raise ValueError("paired clusters and positive resamples are required")
+    if candidate_clusters != comparator_clusters:
+        raise ValueError("candidate and comparator must have identical cluster sets")
+    clusters = sorted(candidate_clusters)
+    if any(not candidate[cluster] or not comparator[cluster] for cluster in clusters):
+        raise ValueError("every paired cluster must contain non-empty candidate and comparator observations")
     differences = {
         cluster: fmean(candidate[cluster]) - fmean(comparator[cluster])
         for cluster in clusters
-        if candidate[cluster] and comparator[cluster]
     }
-    if not differences:
-        raise ValueError("every paired cluster is empty")
     cluster_ids = sorted(differences)
     rng = random.Random(seed)
     samples = sorted(

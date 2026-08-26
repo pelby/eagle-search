@@ -14,16 +14,23 @@ from typing import Any
 from ..contracts import CaptionReceiptV1, CaptionResultV1
 
 
+def _secure_directory(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _secure_directory(path.parent)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
+        os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(value, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
+        os.chmod(path, 0o600)
     except BaseException:
         try:
             os.unlink(temporary)
@@ -46,7 +53,8 @@ class FileReceiptStore:
 
     def put_immutable(self, receipt: CaptionReceiptV1) -> str:
         path = self._path(receipt.image_hash, receipt.receipt_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _secure_directory(self.root)
+        _secure_directory(path.parent)
         payload = receipt.to_dict()
         if path.exists():
             existing = CaptionReceiptV1.from_dict(json.loads(path.read_text(encoding="utf-8")))

@@ -1,0 +1,15 @@
+{
+  "annotation_guide_version": 1,
+  "label_schema_version": 1,
+  "concept_fields": [
+    "diagram_types",
+    "subjects",
+    "visual_style",
+    "colours",
+    "layout",
+    "search_terms"
+  ],
+  "ocr_legibilities": ["high", "medium"],
+  "type_metric": "normalised-alias",
+  "critical_metric": "normalised-substring"
+}

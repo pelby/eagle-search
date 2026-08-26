@@ -19,6 +19,8 @@ from typing import Any, Sequence
 from uuid import uuid4
 
 from . import db
+from .captioning.codex_cli import CAPTION_PROVIDER_NAME
+from .captioning.prompt import CAPTION_PROMPT_VERSION
 from .eagle.importer import FileIntentMetadataStore, GeneratedImageImporter
 from .eagle.notes import NotesApplier, render_caption_block
 from .eagle_api import EagleApiClient
@@ -33,8 +35,8 @@ from .rebuild import load_legacy_manifest, rebuild_database, snapshot_eagle_reco
 from .watcher.host import WatchGeneratedHost
 from .worker.runtime import RunStatusFile
 from .worker.lock import FileLock
-from evals.cli import aggregate_report_json, create_manifest_json
-from evals.runner import PrivateReceiptJournal, load_fixture_manifest, run_caption_stage
+from evals.cli import aggregate_report_json, create_manifest_json, score_stage_b_json
+from evals.runner import PrivateReceiptJournal, completed_run_keys, load_fixture_manifest, run_caption_stage
 
 
 def _default_home() -> Path:
@@ -499,8 +501,26 @@ def _command_eval_captions(arguments: argparse.Namespace, runtime: CliRuntime) -
             effort=arguments.effort,
             receipt_store=receipt_store,
         )
-        if receipt.image_hash != fixture.image_hash:
-            raise RuntimeError(f"fixture content changed before captioning: {fixture.fixture_id}")
+        expected_identity = (
+            fixture.image_hash,
+            CAPTION_PROVIDER_NAME,
+            model,
+            arguments.effort,
+            CAPTION_PROMPT_VERSION,
+            "vision",
+        )
+        actual_identity = (
+            receipt.image_hash,
+            receipt.provider,
+            receipt.model,
+            receipt.effort,
+            receipt.prompt_version,
+            receipt.source,
+        )
+        if actual_identity != expected_identity:
+            raise RuntimeError(
+                f"caption receipt identity did not match requested fixture/candidate: {fixture.fixture_id}"
+            )
         return {
             "effort": arguments.effort,
             "receipt_id": receipt.receipt_id,
@@ -509,20 +529,32 @@ def _command_eval_captions(arguments: argparse.Namespace, runtime: CliRuntime) -
             "latency_seconds": round(time.monotonic() - started, 6),
         }
 
-    created = run_caption_stage(
+    outcome = run_caption_stage(
         manifest,
         stage=arguments.stage,
         models=arguments.model,
+        effort=arguments.effort,
         journal=journal,
         caption=caption,
     )
+    fixture_ids = {fixture.fixture_id for fixture in manifest.fixtures_for(arguments.stage)}
+    requested_models = set(arguments.model)
+    completed = sum(
+        fixture_id in fixture_ids
+        and model in requested_models
+        and (receipt_effort == arguments.effort or (arguments.effort == "low" and not receipt_effort))
+        for fixture_id, model, receipt_effort, prompt_version, _image_hash in completed_run_keys(journal.load())
+        if prompt_version == CAPTION_PROMPT_VERSION
+    )
     return {
         "contract_version": 1,
-        "ok": True,
+        "ok": not outcome.failed,
         "stage": arguments.stage,
         "models": list(arguments.model),
-        "created": len(created),
-        "completed_receipts": len(journal.load()),
+        "created": len(outcome.created),
+        "completed": completed,
+        "failed": len(outcome.failed),
+        "completed_receipts": completed,
     }
 
 
@@ -530,10 +562,23 @@ def _command_eval_report(arguments: argparse.Namespace, runtime: CliRuntime) -> 
     report = aggregate_report_json(
         _eval_path(runtime, arguments.results),
         _eval_path(runtime, arguments.output),
-        comparator=arguments.comparator,
+        snapshot=_eval_path(runtime, arguments.snapshot),
+        gates_path=_eval_path(runtime, arguments.gates),
         allowed_root=runtime.evals_path,
     )
     return {"contract_version": 1, "ok": report["status"] != "failed", **report}
+
+
+def _command_eval_score(arguments: argparse.Namespace, runtime: CliRuntime) -> dict[str, Any]:
+    result = score_stage_b_json(
+        snapshot=_eval_path(runtime, arguments.snapshot),
+        guide_path=_eval_path(runtime, arguments.guide), labels_path=_eval_path(runtime, arguments.labels),
+        query_path=_eval_path(runtime, arguments.queries), embedding_contract_path=_eval_path(runtime, arguments.embedding_contract),
+        gates_path=_eval_path(runtime, arguments.gates), output_path=_eval_path(runtime, arguments.output),
+        embed=lambda text: runtime.embedder.embed([text])[0], allowed_root=runtime.evals_path,
+        embedder_model=runtime.embedder.model,
+    )
+    return {"contract_version": 1, "ok": True, "created": result["created"], "completed": result["completed"], "output": str(_eval_path(runtime, arguments.output))}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -631,9 +676,21 @@ def build_parser() -> argparse.ArgumentParser:
     eval_report = commands.add_parser("eval-report", help="Aggregate private metrics into an anonymous decision report")
     eval_report.add_argument("--results", required=True)
     eval_report.add_argument("--output", required=True)
-    eval_report.add_argument("--comparator", required=True)
+    eval_report.add_argument("--snapshot", required=True)
+    eval_report.add_argument("--gates", required=True)
     eval_report.add_argument("--json", action="store_true")
     eval_report.set_defaults(handler=_command_eval_report)
+
+    eval_score = commands.add_parser("eval-score", help="Score sealed Stage B private receipts with local Nomic embeddings")
+    eval_score.add_argument("--snapshot", required=True)
+    eval_score.add_argument("--guide", required=True)
+    eval_score.add_argument("--labels", required=True)
+    eval_score.add_argument("--queries", required=True)
+    eval_score.add_argument("--embedding-contract", required=True)
+    eval_score.add_argument("--gates", required=True)
+    eval_score.add_argument("--output", required=True)
+    eval_score.add_argument("--json", action="store_true")
+    eval_score.set_defaults(handler=_command_eval_score)
     return parser
 
 

@@ -11,6 +11,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from src import db
+from src.captioning.codex_cli import CAPTION_PROVIDER_NAME, CaptionItemFailure
+from src.captioning.prompt import CAPTION_PROMPT_VERSION
 from src.cli import CliRuntime, build_parser, main
 from src.contracts import CaptionReceiptV1, CaptionResultV1
 from src.persistence.receipts import FileReceiptStore
@@ -29,6 +31,8 @@ class DownEmbedder(FakeEmbedder):
 
 
 class FakeCaptionProvider:
+    provider_name = CAPTION_PROVIDER_NAME
+
     def caption(self, image_path, *, model, effort, receipt_store):
         digest = "sha256:" + hashlib.sha256(Path(image_path).read_bytes()).hexdigest()
         result = CaptionResultV1.from_dict(
@@ -49,14 +53,39 @@ class FakeCaptionProvider:
         receipt = CaptionReceiptV1.create(
             image_hash=digest,
             caption_result=result,
-            provider="fake",
+            provider=self.provider_name,
             model=model,
             effort=effort,
-            prompt_version="caption-v1",
+            prompt_version=CAPTION_PROMPT_VERSION,
             created_at="2026-08-25T22:00:00Z",
         )
         receipt_store.put_immutable(receipt)
         return receipt
+
+
+class OneItemFailureCaptionProvider(FakeCaptionProvider):
+    def __init__(self) -> None:
+        self.failed_once = False
+
+    def caption(self, image_path, *, model, effort, receipt_store):
+        if Path(image_path).name == "first.png" and not self.failed_once:
+            self.failed_once = True
+            raise CaptionItemFailure("transient fixture failure")
+        return super().caption(image_path, model=model, effort=effort, receipt_store=receipt_store)
+
+
+class WrongIdentityCaptionProvider(FakeCaptionProvider):
+    def caption(self, image_path, *, model, effort, receipt_store):
+        return super().caption(
+            image_path,
+            model="gpt-5.6-terra",
+            effort=effort,
+            receipt_store=receipt_store,
+        )
+
+
+class WrongProviderCaptionProvider(FakeCaptionProvider):
+    provider_name = "not-codex"
 
 
 class AmbiguousFirstNotesApi:
@@ -225,6 +254,85 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(first[1]["created"], 1)
         self.assertEqual(second[1]["created"], 0)
         self.assertEqual(second[1]["completed_receipts"], 1)
+        self.assertEqual(second[1]["completed"], 1)
+
+    def test_eval_caption_stage_reports_and_retries_bounded_item_failure(self) -> None:
+        snapshot = self.home / "evals" / "flaky-fixture"
+        snapshot.mkdir(parents=True)
+        fixtures = []
+        for fixture_id in ("first", "later"):
+            image = snapshot / f"{fixture_id}.png"
+            image.write_bytes(f"private {fixture_id}".encode())
+            fixtures.append(
+                {
+                    "fixture_id": fixture_id,
+                    "image_hash": "sha256:" + hashlib.sha256(image.read_bytes()).hexdigest(),
+                    "image_path": str(image),
+                    "stage": "A",
+                    "stratum": "art",
+                    "role": "target",
+                }
+            )
+        (snapshot / "manifest.json").write_text(
+            json.dumps({"snapshot_version": 1, "snapshot_id": "flaky-fixture", "fixtures": fixtures}),
+            encoding="utf-8",
+        )
+        provider = OneItemFailureCaptionProvider()
+        arguments = [
+            "eval-captions",
+            "--snapshot",
+            str(snapshot),
+            "--stage",
+            "A",
+            "--model",
+            "gpt-5.6-luna",
+            "--effort",
+            "low",
+            "--json",
+        ]
+
+        first = self.invoke(arguments, caption_provider=provider)
+        self.assertEqual(first[0], 1)
+        self.assertFalse(first[1]["ok"])
+        self.assertEqual({key: first[1][key] for key in ("created", "completed", "failed")}, {"created": 1, "completed": 1, "failed": 1})
+        self.assertNotIn("private", json.dumps(first[1]))
+
+        retried = self.invoke(arguments, caption_provider=provider)
+        self.assertEqual(retried[0], 0)
+        self.assertTrue(retried[1]["ok"])
+        self.assertEqual({key: retried[1][key] for key in ("created", "completed", "failed")}, {"created": 1, "completed": 2, "failed": 0})
+
+    def test_eval_caption_refuses_provider_receipt_for_a_different_candidate(self) -> None:
+        snapshot = self.home / "evals" / "wrong-identity"
+        snapshot.mkdir(parents=True)
+        image = snapshot / "image.png"
+        image.write_bytes(b"private image")
+        image_hash = "sha256:" + hashlib.sha256(image.read_bytes()).hexdigest()
+        (snapshot / "manifest.json").write_text(json.dumps({
+            "snapshot_version": 1,
+            "snapshot_id": "wrong-identity",
+            "fixtures": [{
+                "fixture_id": "f-0001", "image_hash": image_hash,
+                "image_path": str(image), "stage": "A", "stratum": "art",
+                "role": "target",
+            }],
+        }), encoding="utf-8")
+
+        exit_code, payload, _, _ = self.invoke([
+            "eval-captions", "--snapshot", str(snapshot), "--stage", "A",
+            "--model", "gpt-5.6-luna", "--effort", "low", "--json",
+        ], caption_provider=WrongIdentityCaptionProvider())
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["error"]["code"], "operation_failed")
+        self.assertFalse((snapshot / "caption-receipts").exists())
+
+        exit_code, payload, _, _ = self.invoke([
+            "eval-captions", "--snapshot", str(snapshot), "--stage", "A",
+            "--model", "gpt-5.6-luna", "--effort", "low", "--json",
+        ], caption_provider=WrongProviderCaptionProvider())
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["error"]["code"], "operation_failed")
 
     def test_eval_paths_outside_private_root_are_refused(self) -> None:
         exit_code, payload, _, _ = self.invoke(
@@ -234,8 +342,10 @@ class CliContractTests(unittest.TestCase):
                 "/tmp/not-private.json",
                 "--output",
                 "/tmp/report.json",
-                "--comparator",
-                "gpt-5.6-terra",
+                "--snapshot",
+                "/tmp/snapshot",
+                "--gates",
+                "/tmp/gates.json",
                 "--json",
             ]
         )

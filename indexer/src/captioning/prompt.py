@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Any
 
 
-CAPTION_PROMPT_VERSION = "caption-v2"
+# v3 includes the visual-input contract: SVG payloads stored under misleading
+# Eagle cache suffixes are rasterised onto white before the model sees them.
+# Bumping the receipt identity prevents reuse of captions made from absent or
+# incorrectly composited pixels under the earlier provider boundary.
+CAPTION_PROMPT_VERSION = "caption-v3"
 _SCHEMA_PATH = Path(__file__).resolve().parents[2] / "schemas" / "caption-result-v1.schema.json"
 
 

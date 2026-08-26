@@ -5,18 +5,40 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import fmean
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from src.selection_instrument import SelectionDocument, SelectionInstrument
+from src.captioning.codex_cli import CaptionItemFailure
 from src.captioning.prompt import CAPTION_PROMPT_VERSION
 
 from .metrics import ndcg_at_k, recall_at_k, reciprocal_rank
 
 
 PRIVATE_EVAL_ROOT = Path.home() / ".eagle-search" / "evals"
+
+
+def _write_private_json(destination: Path, payload: Mapping[str, Any]) -> None:
+    destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(destination.parent, 0o700)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(_canonical_json(payload))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+        os.chmod(destination, 0o600)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def _canonical_json(payload: Mapping[str, Any]) -> bytes:
@@ -29,15 +51,30 @@ def seal_hidden_manifest(payload: Mapping[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(_canonical_json(payload)).hexdigest()
 
 
-def completed_run_keys(receipts: Iterable[Mapping[str, str]]) -> set[tuple[str, str, str, str]]:
-    """Return content-addressed resume keys; model outputs never share a cache entry."""
+def completed_run_keys(receipts: Iterable[Mapping[str, Any]]) -> set[tuple[str, str, str, str, str]]:
+    """Return successful resume keys, including the requested reasoning effort.
+
+    Receipts written before effort became part of the journal identity retain an
+    empty effort component.  ``run_caption_stage`` recognises that legacy key so
+    old valid receipts remain resumable rather than being discarded.
+    """
 
     required = ("fixture_id", "model", "prompt_version", "image_hash")
-    keys: set[tuple[str, str, str, str]] = set()
+    keys: set[tuple[str, str, str, str, str]] = set()
     for receipt in receipts:
+        if receipt.get("state") == "failed":
+            continue
         if not all(receipt.get(name) for name in required):
             continue
-        keys.add(tuple(receipt[name] for name in required))
+        keys.add(
+            (
+                str(receipt["fixture_id"]),
+                str(receipt["model"]),
+                str(receipt.get("effort", "")),
+                str(receipt["prompt_version"]),
+                str(receipt["image_hash"]),
+            )
+        )
     return keys
 
 
@@ -91,9 +128,12 @@ class PrivateReceiptJournal:
         self.snapshot = assert_private_snapshot(snapshot) if enforce_private_root else Path(snapshot).resolve()
         self.receipt_dir = self.snapshot / "caption-receipts"
 
-    def _path_for(self, fixture_id: str, model: str, prompt_version: str, image_hash: str) -> Path:
-        digest = hashlib.sha256("\0".join((fixture_id, model, prompt_version, image_hash)).encode()).hexdigest()
+    def _path_for(self, fixture_id: str, model: str, effort: str, prompt_version: str, image_hash: str) -> Path:
+        digest = hashlib.sha256("\0".join((fixture_id, model, effort, prompt_version, image_hash)).encode()).hexdigest()
         return self.receipt_dir / f"{digest}.json"
+
+    def _failed_path_for(self, fixture_id: str, model: str, effort: str, prompt_version: str, image_hash: str) -> Path:
+        return self._path_for(fixture_id, model, effort, prompt_version, image_hash).with_suffix(".failed.json")
 
     def load(self) -> list[dict[str, Any]]:
         if not self.receipt_dir.exists():
@@ -105,17 +145,33 @@ class PrivateReceiptJournal:
         return loaded
 
     def put(self, receipt: Mapping[str, Any]) -> Path:
-        required = ("fixture_id", "model", "prompt_version", "image_hash")
+        required = ("fixture_id", "model", "effort", "prompt_version", "image_hash")
         if not all(receipt.get(name) for name in required):
             raise ValueError("private eval receipt is missing its resume identity")
         destination = self._path_for(*(str(receipt[name]) for name in required))
+        failed_destination = self._failed_path_for(*(str(receipt[name]) for name in required))
         destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(destination.parent, 0o700)
         if destination.exists():
+            failed_destination.unlink(missing_ok=True)
             return destination
-        temporary = destination.with_suffix(".tmp")
-        temporary.write_bytes(_canonical_json(dict(receipt)))
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, destination)
+        _write_private_json(destination, dict(receipt))
+        failed_destination.unlink(missing_ok=True)
+        return destination
+
+    def put_failed_attempt(self, failure: Mapping[str, Any]) -> Path:
+        """Persist one latest retryable failure per identity without marking it complete."""
+
+        required = ("fixture_id", "model", "effort", "prompt_version", "image_hash")
+        if not all(failure.get(name) for name in required) or failure.get("state") != "failed":
+            raise ValueError("private eval failure is missing its retry identity")
+        successful_destination = self._path_for(*(str(failure[name]) for name in required))
+        destination = self._failed_path_for(*(str(failure[name]) for name in required))
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(destination.parent, 0o700)
+        if successful_destination.exists():
+            return successful_destination
+        _write_private_json(destination, dict(failure))
         return destination
 
 
@@ -216,15 +272,24 @@ def load_fixture_manifest(snapshot: Path, *, enforce_private_root: bool = True) 
     )
 
 
+@dataclass(frozen=True)
+class CaptionStageOutcome:
+    """Local result counts with no image paths, hashes, or caption content."""
+
+    created: tuple[dict[str, Any], ...]
+    failed: tuple[dict[str, Any], ...]
+
+
 def run_caption_stage(
     manifest: FixtureManifest,
     *,
     stage: str,
     models: Sequence[str],
+    effort: str,
     journal: PrivateReceiptJournal,
     caption: Callable[[EvalFixture, str], Mapping[str, Any]],
     prompt_version: str = CAPTION_PROMPT_VERSION,
-) -> list[dict[str, Any]]:
+) -> CaptionStageOutcome:
     """Run only missing fixture/model work and persist a local atomic resume receipt.
 
     ``caption`` is injected so the orchestration stays testable and never calls a
@@ -234,21 +299,42 @@ def run_caption_stage(
 
     completed = completed_run_keys(journal.load())
     created: list[dict[str, Any]] = []
+    failed: list[dict[str, Any]] = []
     for fixture in manifest.fixtures_for(stage):
         for model in models:
-            identity = (fixture.fixture_id, model, prompt_version, fixture.image_hash)
-            if identity in completed:
+            identity = (fixture.fixture_id, model, effort, prompt_version, fixture.image_hash)
+            legacy_identity = (fixture.fixture_id, model, "", prompt_version, fixture.image_hash)
+            # Historical journals were produced at the then-only/default low
+            # effort.  They can safely satisfy a low run, but must never mask a
+            # newly requested medium-effort experiment.
+            if identity in completed or (effort == "low" and legacy_identity in completed):
                 continue
-            payload = dict(caption(fixture, model))
+            try:
+                payload = dict(caption(fixture, model))
+            except CaptionItemFailure as error:
+                failure = {
+                    "fixture_id": fixture.fixture_id,
+                    "model": model,
+                    "effort": effort,
+                    "prompt_version": prompt_version,
+                    "image_hash": fixture.image_hash,
+                    "manifest_hash": manifest.manifest_hash,
+                    "state": "failed",
+                    "error": " ".join(str(error).split())[:500] or "caption item failed",
+                }
+                journal.put_failed_attempt(failure)
+                failed.append(failure)
+                continue
             receipt = {
+                **payload,
                 "fixture_id": fixture.fixture_id,
                 "model": model,
+                "effort": effort,
                 "prompt_version": prompt_version,
                 "image_hash": fixture.image_hash,
                 "manifest_hash": manifest.manifest_hash,
-                **payload,
             }
             journal.put(receipt)
             completed.add(identity)
             created.append(receipt)
-    return created
+    return CaptionStageOutcome(tuple(created), tuple(failed))

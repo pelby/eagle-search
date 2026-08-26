@@ -24,6 +24,8 @@ from evals.runner import (
     run_caption_stage,
     seal_hidden_manifest,
 )
+from src.captioning.codex_cli import CaptionGlobalFailure, CaptionItemFailure
+from src.captioning.prompt import CAPTION_PROMPT_VERSION
 from src.selection_instrument import SelectionDocument
 
 
@@ -74,7 +76,7 @@ class EvalMetricTests(unittest.TestCase):
 
         self.assertNotEqual(seal_hidden_manifest(base), seal_hidden_manifest(changed))
 
-    def test_candidate_retrieval_isolated_and_resume_keys_are_specific(self) -> None:
+    def test_candidate_retrieval_isolated_and_resume_keys_are_effort_specific(self) -> None:
         documents = {
             "luna": [SelectionDocument("target", "classroom teacher")],
             "terra": [SelectionDocument("target", "abstract geometry")],
@@ -89,11 +91,11 @@ class EvalMetricTests(unittest.TestCase):
         self.assertEqual(
             completed_run_keys(
                 [
-                    {"fixture_id": "one", "model": "luna", "prompt_version": "caption-v1", "image_hash": "sha256:a"},
-                    {"fixture_id": "one", "model": "terra", "prompt_version": "caption-v1", "image_hash": "sha256:a"},
+                    {"fixture_id": "one", "model": "luna", "effort": "low", "prompt_version": "caption-v1", "image_hash": "sha256:a"},
+                    {"fixture_id": "one", "model": "luna", "effort": "medium", "prompt_version": "caption-v1", "image_hash": "sha256:a"},
                 ]
             ),
-            {("one", "luna", "caption-v1", "sha256:a"), ("one", "terra", "caption-v1", "sha256:a")},
+            {("one", "luna", "low", "caption-v1", "sha256:a"), ("one", "luna", "medium", "caption-v1", "sha256:a")},
         )
 
     def test_private_manifest_stage_runner_is_resumable_without_cross_model_cache(self) -> None:
@@ -115,12 +117,103 @@ class EvalMetricTests(unittest.TestCase):
                 calls.append((fixture.fixture_id, model))
                 return {"caption_result": {"summary": "private"}}
 
-            first = run_caption_stage(manifest, stage="A", models=["gpt-5.6-luna"], journal=journal, caption=caption)
-            second = run_caption_stage(manifest, stage="A", models=["gpt-5.6-luna"], journal=journal, caption=caption)
+            first = run_caption_stage(manifest, stage="A", models=["gpt-5.6-luna"], effort="low", journal=journal, caption=caption)
+            second = run_caption_stage(manifest, stage="A", models=["gpt-5.6-luna"], effort="low", journal=journal, caption=caption)
+            medium = run_caption_stage(manifest, stage="A", models=["gpt-5.6-luna"], effort="medium", journal=journal, caption=caption)
 
-            self.assertEqual(len(first), 1)
-            self.assertEqual(second, [])
-            self.assertEqual(calls, [("smoke", "gpt-5.6-luna")])
+            self.assertEqual(len(first.created), 1)
+            self.assertEqual(second.created, ())
+            self.assertEqual(len(medium.created), 1)
+            self.assertEqual(calls, [("smoke", "gpt-5.6-luna"), ("smoke", "gpt-5.6-luna")])
+            self.assertEqual(len(journal.load()), 2)
+
+    def test_item_failure_is_bounded_retryable_and_global_failure_stops_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "private"
+            snapshot.mkdir()
+            (snapshot / "manifest.json").write_text(
+                '{"snapshot_version":1,"snapshot_id":"safe","fixtures":['
+                '{"fixture_id":"first","image_hash":"sha256:a","image_path":"/private/a.png","stage":"A"},'
+                '{"fixture_id":"later","image_hash":"sha256:b","image_path":"/private/b.png","stage":"A"}'
+                ']}',
+                encoding="utf-8",
+            )
+            journal = PrivateReceiptJournal(snapshot, enforce_private_root=False)
+            manifest = load_fixture_manifest(snapshot, enforce_private_root=False)
+            calls = []
+
+            def flaky_caption(fixture, model):
+                calls.append(fixture.fixture_id)
+                if fixture.fixture_id == "first" and calls.count("first") == 1:
+                    raise CaptionItemFailure("transient fixture failure")
+                return {"caption_result": {"summary": "private"}}
+
+            first = run_caption_stage(manifest, stage="A", models=["gpt-5.6-luna"], effort="low", journal=journal, caption=flaky_caption)
+            self.assertEqual(len(first.created), 1)
+            self.assertEqual(len(first.failed), 1)
+            self.assertEqual(calls, ["first", "later"])
+            self.assertEqual(len(completed_run_keys(journal.load())), 1)
+
+            retried = run_caption_stage(manifest, stage="A", models=["gpt-5.6-luna"], effort="low", journal=journal, caption=flaky_caption)
+            self.assertEqual(len(retried.created), 1)
+            self.assertEqual(retried.failed, ())
+            self.assertEqual(calls, ["first", "later", "first"])
+            self.assertEqual(len(completed_run_keys(journal.load())), 2)
+            self.assertFalse(any(entry.get("state") == "failed" for entry in journal.load()))
+
+            global_calls = []
+
+            def globally_unavailable(fixture, model):
+                global_calls.append(fixture.fixture_id)
+                raise CaptionGlobalFailure("quota exhausted")
+
+            with self.assertRaises(CaptionGlobalFailure):
+                run_caption_stage(manifest, stage="A", models=["gpt-5.6-terra"], effort="low", journal=journal, caption=globally_unavailable)
+            self.assertEqual(global_calls, ["first"])
+
+    def test_legacy_valid_receipt_without_effort_remains_resumable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = Path(temporary) / "private"
+            snapshot.mkdir()
+            (snapshot / "manifest.json").write_text(
+                '{"snapshot_version":1,"snapshot_id":"safe","fixtures":['
+                '{"fixture_id":"smoke","image_hash":"sha256:a","image_path":"/private/a.png","stage":"A"}'
+                ']}',
+                encoding="utf-8",
+            )
+            receipt_directory = snapshot / "caption-receipts"
+            receipt_directory.mkdir()
+            (receipt_directory / "legacy.json").write_text(
+                '{"fixture_id":"smoke","model":"gpt-5.6-luna","prompt_version":"'
+                + CAPTION_PROMPT_VERSION
+                + '","image_hash":"sha256:a"}',
+                encoding="utf-8",
+            )
+            journal = PrivateReceiptJournal(snapshot, enforce_private_root=False)
+            manifest = load_fixture_manifest(snapshot, enforce_private_root=False)
+            calls = []
+
+            low = run_caption_stage(
+                manifest,
+                stage="A",
+                models=["gpt-5.6-luna"],
+                effort="low",
+                journal=journal,
+                caption=lambda fixture, model: calls.append((fixture, model)),
+            )
+            medium = run_caption_stage(
+                manifest,
+                stage="A",
+                models=["gpt-5.6-luna"],
+                effort="medium",
+                journal=journal,
+                caption=lambda fixture, model: calls.append((fixture, model)) or {"caption_result": {"summary": "private"}},
+            )
+
+            self.assertEqual(low.created, ())
+            self.assertEqual(low.failed, ())
+            self.assertEqual(len(medium.created), 1)
+            self.assertEqual(calls, [(manifest.fixtures[0], "gpt-5.6-luna")])
 
 
 if __name__ == "__main__":
