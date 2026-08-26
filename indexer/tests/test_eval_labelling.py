@@ -91,6 +91,12 @@ class BlindLabellingTests(unittest.TestCase):
         self.openai = batch(provider="openai", model="gpt-5.6-sol", batch_id="batch-a", guide_hash=self.guide_hash)
         self.non_openai = batch(provider="anthropic", model="claude", batch_id="batch-b", guide_hash=self.guide_hash)
 
+    def test_v2_guide_separates_atomic_concepts_from_semantic_queries(self) -> None:
+        guide = load_annotation_guide(2)
+        self.assertEqual(guide["concept_metric"], "token-aware-alias-recall")
+        self.assertEqual(guide["semantic_query_policy"], "separate-frozen-query-artifact")
+        self.assertEqual(guide["critical_metric"], "token-phrase")
+
     def test_handoff_schema_is_strict_and_keys_labels_by_fixture_identifier(self) -> None:
         schema = load_batch_schema()
         labels = schema["properties"]["labels"]

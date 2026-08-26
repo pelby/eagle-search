@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import stat
 import tempfile
@@ -13,11 +14,13 @@ from evals.cli import (
     EvalCliError,
     _validated_caption_receipts,
     aggregate_report_json,
+    aggregate_stage_c_report_json,
     create_manifest_json,
     score_stage_b_json,
+    score_stage_c_json,
 )
 from evals.runner import PrivateReceiptJournal, load_fixture_manifest
-from evals.report import FROZEN_EVALUATION_THRESHOLDS
+from evals.report import FROZEN_EVALUATION_THRESHOLDS, FROZEN_FINAL_SELECTION_THRESHOLDS
 from evals.study import artifact_sha256
 from src.captioning.codex_cli import CAPTION_INPUT_PREPARATION_VERSION
 from src.captioning.prompt import CAPTION_PROMPT_VERSION
@@ -41,15 +44,19 @@ def candidate_result(model: str):
         "ndcg_at_10": 0.90, "recall_at_10": 0.94, "known_query_passed": True,
         "background_throughput_accepted": False,
         "lower_bounds": {"ndcg_at_10": -0.01, "recall_at_10": -0.01, "concept_f1": -0.01, "ocr_character_f1": -0.01},
-        "lanes": {"bm25": {"ndcg_at_10": 0.88}, "nomic": {"ndcg_at_10": 0.87}, "rrf": {"ndcg_at_10": 0.90}},
+        "lanes": {
+            "bm25": {"ndcg_at_10": 0.88, "recall_at_10": 0.92, "mrr": 0.81},
+            "semantic": {"ndcg_at_10": 0.87, "recall_at_10": 0.91, "mrr": 0.79},
+            "rrf": {"ndcg_at_10": 0.90, "recall_at_10": 0.94, "mrr": 0.84},
+        },
         "latencies_seconds": [1.0, 2.0] * 21,
     }
 
 
-def sealed_report_evidence(root: Path, *, result_candidates=None):
+def sealed_report_evidence(root: Path, *, result_candidates=None, gates_version: int = 1):
     snapshot = root / "snapshot"
     gates = {
-        "gates_version": 1,
+        "gates_version": gates_version,
         "guide_hash": "sha256:" + "1" * 64,
         "labels_hash": "sha256:" + "2" * 64,
         "query_artifact_hash": "sha256:" + "3" * 64,
@@ -63,6 +70,8 @@ def sealed_report_evidence(root: Path, *, result_candidates=None):
         "input_preparation_version": CAPTION_INPUT_PREPARATION_VERSION,
         "thresholds": FROZEN_EVALUATION_THRESHOLDS,
     }
+    if gates_version == 2:
+        gates["final_selection_thresholds"] = FROZEN_FINAL_SELECTION_THRESHOLDS
     gates_path = root / "gates.json"
     gates_path.write_text(json.dumps(gates), encoding="utf-8")
     candidates_path = root / "candidates.json"
@@ -96,10 +105,148 @@ def sealed_report_evidence(root: Path, *, result_candidates=None):
             candidate_result("gpt-5.6-luna"), candidate_result("gpt-5.6-terra")
         ],
     }
+    if gates_version == 2:
+        results.update({
+            "gates_version": 2,
+            "final_selection_thresholds": FROZEN_FINAL_SELECTION_THRESHOLDS,
+        })
     return snapshot, gates_path, results
 
 
+def final_candidate_result(model: str):
+    return {
+        **candidate_result(model),
+        "concept_precision": 0.20,
+        "concept_f1": 0.33,
+        "concept_recall": 0.84,
+        "annotation_guide_version": 2,
+        "selection_mode": "final",
+        "pooled_relevance_hash": "sha256:" + "a" * 64,
+        "ocr_bearing_target_count": 1,
+        "ocr_bearing_character_f1": 0.94,
+        "lower_bounds": {"ndcg_at_10": -0.01, "recall_at_10": -0.01, "concept_recall": -0.01, "ocr_character_f1": -0.01},
+        "lane_lower_bounds": {
+            "bm25": {"ndcg_at_10": -0.01, "recall_at_10": -0.01},
+            "semantic": {"ndcg_at_10": -0.01, "recall_at_10": -0.01},
+        },
+    }
+
+
 class EvalCliSupportTests(unittest.TestCase):
+    def test_stage_c_score_and_report_require_sealed_approval_and_owner_only_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot, _stage_b_gates_path, _ = sealed_report_evidence(root)
+            manifest = load_fixture_manifest(snapshot, enforce_private_root=False)
+            stage_c_candidates = [
+                f"gpt-5.6-luna:low:{CAPTION_PROMPT_VERSION}",
+                f"gpt-5.6-sol:low:{CAPTION_PROMPT_VERSION}",
+            ]
+            effects = {
+                "stage_b_effects_version": 2,
+                "stage_b_results_hash": "sha256:" + "5" * 64,
+                "stage_c_candidates": stage_c_candidates,
+                "candidate_powered_target_counts": {
+                    identity: 60 for identity in stage_c_candidates
+                },
+                "powered_hidden_target_count": 60,
+            }
+            gates = {
+                "stage_c_gates_version": 2,
+                "snapshot_hash": manifest.manifest_hash,
+                "stage_b_effects_hash": artifact_sha256(effects),
+                "guide_hash": "sha256:" + "6" * 64,
+                "labels_hash": "sha256:" + "7" * 64,
+                "query_artifact_hash": "sha256:" + "8" * 64,
+                "embedding_contract_hash": "sha256:" + "9" * 64,
+                "candidates": stage_c_candidates,
+                "comparator": f"gpt-5.6-sol:low:{CAPTION_PROMPT_VERSION}",
+                "selection_algorithm": "stratified-shuffle-v1",
+                "selection_seed": 42,
+                "seed": 43,
+                "prompt_version": CAPTION_PROMPT_VERSION,
+                "input_preparation_version": CAPTION_INPUT_PREPARATION_VERSION,
+                "thresholds": FROZEN_EVALUATION_THRESHOLDS,
+                "final_selection_thresholds": FROZEN_FINAL_SELECTION_THRESHOLDS,
+            }
+            approval = {
+                "approval_version": 1,
+                "approved": True,
+                "gates_hash": artifact_sha256(gates),
+            }
+            artifacts = {
+                "stage-c-gates.json": gates,
+                "approval.json": approval,
+                "effects.json": effects,
+                "guide-c.json": {},
+                "labels-c.json": {},
+                "queries-c.json": {},
+                "embedding-c.json": {"model": "nomic-embed-text:v1.5", "dimensions": 768},
+            }
+            for name, payload in artifacts.items():
+                (root / name).write_text(json.dumps(payload), encoding="utf-8")
+            synthetic = {
+                "study_version": 1,
+                "stage": "C",
+                "guide_hash": gates["guide_hash"],
+                "labels_hash": gates["labels_hash"],
+                "query_artifact_hash": gates["query_artifact_hash"],
+                "embedding_contract_hash": gates["embedding_contract_hash"],
+                "manifest_hash": manifest.manifest_hash,
+                "selection_mode": "preliminary",
+                "pooled_relevance_hash": None,
+                "stage_c_gates_hash": artifact_sha256(gates),
+                "approval_hash": artifact_sha256(approval),
+                "selected_target_count": 60,
+                "completed": 360,
+                "candidates": [candidate_result("gpt-5.6-luna"), candidate_result("gpt-5.6-sol")],
+            }
+            results_path = root / "stage-c" / "results.json"
+            with (
+                patch("evals.cli._validated_caption_receipts", return_value=[{"sealed": True}]),
+                patch("evals.cli.run_stage_c_study", return_value=synthetic),
+            ):
+                result = score_stage_c_json(
+                    snapshot=snapshot,
+                    guide_path=root / "guide-c.json",
+                    labels_path=root / "labels-c.json",
+                    query_path=root / "queries-c.json",
+                    embedding_contract_path=root / "embedding-c.json",
+                    gates_path=root / "stage-c-gates.json",
+                    approval_path=root / "approval.json",
+                    stage_b_effects_path=root / "effects.json",
+                    output_path=results_path,
+                    embed=lambda _text: [1.0] * 768,
+                    allowed_root=root,
+                    embedder_model="nomic-embed-text:v1.5",
+                )
+            self.assertEqual(result["completed"], 360)
+            self.assertEqual(result["stage_c_gates_version"], 2)
+            self.assertEqual(result["final_selection_thresholds"], FROZEN_FINAL_SELECTION_THRESHOLDS)
+            self.assertEqual(stat.S_IMODE(results_path.stat().st_mode), 0o600)
+            report = aggregate_stage_c_report_json(
+                results_path,
+                root / "stage-c" / "report.json",
+                snapshot=snapshot,
+                gates_path=root / "stage-c-gates.json",
+                approval_path=root / "approval.json",
+                allowed_root=root,
+            )
+            self.assertEqual(report["selection_mode"], "preliminary")
+
+            (root / "approval.json").write_text(
+                json.dumps({**approval, "approved": False}), encoding="utf-8"
+            )
+            with self.assertRaises(EvalCliError):
+                aggregate_stage_c_report_json(
+                    results_path,
+                    root / "stage-c" / "tampered.json",
+                    snapshot=snapshot,
+                    gates_path=root / "stage-c-gates.json",
+                    approval_path=root / "approval.json",
+                    allowed_root=root,
+                )
+
     def test_eval_journal_hardens_preexisting_directory_and_file_owner_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             snapshot = Path(temporary) / "snapshot"
@@ -305,6 +452,22 @@ class EvalCliSupportTests(unittest.TestCase):
             self.assertNotIn("secret", rendered)
             self.assertNotIn("cost", rendered.casefold())
 
+            malicious = copy.deepcopy(results)
+            malicious["candidates"][0]["strata"] = {
+                "/private/alex/image.png": {"caption": "very private"}
+            }
+            source.write_text(json.dumps(malicious), encoding="utf-8")
+            refused_output = root / "refused-report.json"
+            with self.assertRaisesRegex(EvalCliError, "invalid aggregate metrics"):
+                aggregate_report_json(
+                    source,
+                    refused_output,
+                    snapshot=snapshot,
+                    gates_path=gates_path,
+                    allowed_root=root,
+                )
+            self.assertFalse(refused_output.exists())
+
     def test_rejects_malformed_candidate_instead_of_silently_omitting_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -322,6 +485,42 @@ class EvalCliSupportTests(unittest.TestCase):
                     gates_path=gates_path,
                     allowed_root=root,
                 )
+
+    def test_final_report_refuses_preliminary_or_unsealed_pooled_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot, gates_path, results = sealed_report_evidence(root)
+            source = root / "results.json"
+            source.write_text(json.dumps(results), encoding="utf-8")
+            with self.assertRaisesRegex(EvalCliError, "final selection"):
+                aggregate_report_json(
+                    source, root / "report.json", snapshot=snapshot,
+                    gates_path=gates_path, allowed_root=root, final_selection=True,
+                )
+
+    def test_forged_final_report_is_refused_even_with_plausible_hashes_and_thresholds(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            snapshot, gates_path, results = sealed_report_evidence(
+                root,
+                gates_version=2,
+                result_candidates=[final_candidate_result("gpt-5.6-luna"), final_candidate_result("gpt-5.6-terra")],
+            )
+            final_results = {
+                **results,
+                "selection_mode": "final",
+                "annotation_guide_version": 2,
+                "pooled_relevance_hash": "sha256:" + "a" * 64,
+                "blind_pool_hash": "sha256:" + "b" * 64,
+            }
+            source = root / "final-results.json"
+            source.write_text(json.dumps(final_results), encoding="utf-8")
+            with self.assertRaisesRegex(EvalCliError, "only by eval-score"):
+                aggregate_report_json(
+                    source, root / "final-report.json", snapshot=snapshot,
+                    gates_path=gates_path, allowed_root=root, final_selection=True,
+                )
+            self.assertFalse((root / "final-report.json").exists())
 
 
 if __name__ == "__main__":

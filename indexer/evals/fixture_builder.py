@@ -218,10 +218,14 @@ def private_manifest_summary(manifest: Mapping[str, Any]) -> dict[str, Any]:
     validate_private_manifest(manifest)
     counts = Counter((fixture["stage"], fixture["role"]) for fixture in manifest["fixtures"])
     strata = Counter(fixture["stratum"] for fixture in manifest["fixtures"])
+    anonymous_strata = {
+        f"stratum-{index:02d}": count
+        for index, (_name, count) in enumerate(sorted(strata.items()), start=1)
+    }
     return {
         "snapshot_version": 1,
         "seed": manifest["seed"],
         "hidden_seal": manifest["hidden_seal"],
         "counts": {f"{stage}:{role}": counts[(stage, role)] for stage, role in sorted(counts)},
-        "strata_counts": dict(sorted(strata.items())),
+        "strata_counts": anonymous_strata,
     }

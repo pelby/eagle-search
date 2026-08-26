@@ -9,10 +9,13 @@ from evals.report import CandidateAggregate
 from evals.study import (
     CandidateSpec,
     StudyValidationError,
+    _known_query_target_passed,
     artifact_sha256,
+    candidate_set_hash,
     run_stage_b_study,
     validate_frozen_annotations,
 )
+from evals.metrics import token_aware_concept_recall, token_phrase_matches
 
 
 GUIDE = {
@@ -22,6 +25,13 @@ GUIDE = {
     "ocr_legibilities": ["high", "medium"],
     "type_metric": "normalised-alias",
     "critical_metric": "normalised-substring",
+}
+GUIDE_V2 = {
+    **GUIDE,
+    "annotation_guide_version": 2,
+    "concept_metric": "token-aware-alias-recall",
+    "semantic_query_policy": "separate-frozen-query-artifact",
+    "critical_metric": "token-phrase",
 }
 
 LABELS = {
@@ -107,6 +117,30 @@ class EvalStudyTests(unittest.TestCase):
         self.luna = CandidateSpec("gpt-5.6-luna", "low", "caption-v1")
         self.terra = CandidateSpec("gpt-5.6-terra", "low", "caption-v1")
 
+    def test_v2_concept_coverage_and_critical_terms_are_token_aware(self) -> None:
+        self.assertEqual(
+            token_aware_concept_recall(
+                ["A bright-red circle", "two people"],
+                [{"red circle"}, {"people", "persons"}],
+            ),
+            1.0,
+        )
+        self.assertTrue(token_phrase_matches("a human figure", "human"))
+        self.assertFalse(token_phrase_matches("a humanoid figure", "human"))
+
+    def test_known_query_requires_exact_frozen_target_not_an_alternate_pooled_positive(self) -> None:
+        pooled_grades = {"alternate-classroom": 2, "frozen-classroom": 3}
+        ranking = ["alternate-classroom"]
+
+        self.assertGreater(pooled_grades[ranking[0]], 0)
+        self.assertFalse(_known_query_target_passed(ranking, "frozen-classroom"))
+        self.assertTrue(
+            _known_query_target_passed(
+                ["alternate-classroom", "frozen-classroom"],
+                "frozen-classroom",
+            )
+        )
+
     def _receipts(self) -> list[dict]:
         output: list[dict] = []
         good = {
@@ -182,9 +216,15 @@ class EvalStudyTests(unittest.TestCase):
         self.assertEqual(luna["lanes"]["bm25"]["recall_at_10"], 1.0)
         self.assertEqual(luna["lanes"]["semantic"]["recall_at_10"], 1.0)
         self.assertEqual(luna["lanes"]["rrf"]["recall_at_10"], 1.0)
+        self.assertEqual(luna["strata"]["unstratified"]["retrieval_lanes"]["rrf"]["recall_at_10"], 1.0)
         self.assertEqual(result["semantic_rrf_status"]["state"], "scored")
         self.assertEqual(len(calls), 10)  # two frozen queries plus four candidate-owned documents per tier
         self.assertEqual(result["bootstrap_resamples"], 10_000)
+        self.assertEqual(result["selection_mode"], "preliminary")
+        self.assertIsNone(result["pooled_relevance_hash"])
+        self.assertIn("unstratified", luna["strata"])
+        self.assertEqual(luna["ocr_bearing_target_count"], 2)
+        self.assertEqual(luna["ocr_bearing_character_f1"], 1.0)
 
         report_fields = {
             "model", "effort", "schema_valid_rate", "critical_hallucinations", "concept_precision", "concept_f1",
@@ -193,6 +233,138 @@ class EvalStudyTests(unittest.TestCase):
         }
         aggregates = [CandidateAggregate(**{key: candidate[key] for key in report_fields}) for candidate in result["candidates"]]
         self.assertEqual(len(aggregates), 2)
+
+    def test_final_selection_requires_a_hash_bound_blind_pooled_relevance_artifact(self) -> None:
+        base_hash = artifact_sha256(QUERY_ARTIFACT)
+        candidate_hash = candidate_set_hash([self.luna, self.terra])
+        preliminary = run_stage_b_study(
+            guide=GUIDE,
+            labels=LABELS,
+            expected_guide_hash=artifact_sha256(GUIDE),
+            expected_labels_hash=artifact_sha256(LABELS),
+            fixtures=FIXTURES,
+            receipts=self._receipts(),
+            query_artifact=QUERY_ARTIFACT,
+            expected_query_hash=base_hash,
+            embedding_contract=EMBEDDING_CONTRACT,
+            expected_embedding_contract_hash=artifact_sha256(EMBEDDING_CONTRACT),
+            embed=deterministic_embedder([]),
+            candidates=[self.luna, self.terra],
+            comparator=self.terra,
+            manifest_hash="sha256:" + "a" * 64,
+            seed=7,
+            power_simulations=20,
+        )
+        blind_pool = preliminary["blind_pool"]
+        packet_evidence_hash = "sha256:" + "e" * 64
+        pooled = {
+            "pooled_relevance_version": 2,
+            "manifest_hash": "sha256:" + "a" * 64,
+            "base_query_artifact_hash": base_hash,
+            "candidate_set_hash": candidate_hash,
+            "blind_pool_hash": preliminary["blind_pool_hash"],
+            "packet_evidence_hash": packet_evidence_hash,
+            "blinded": True,
+            "adjudication_complete": True,
+            "query_grades": {
+                item["query_id"]: {
+                    fixture_id: item["grades"].get(fixture_id, 0)
+                    for fixture_id in set(blind_pool["query_items"][item["query_id"]]) | set(item["grades"])
+                }
+                for item in QUERIES
+            },
+        }
+        common = {
+            "guide": GUIDE_V2,
+            "labels": LABELS,
+            "expected_guide_hash": artifact_sha256(GUIDE_V2),
+            "expected_labels_hash": artifact_sha256(LABELS),
+            "fixtures": FIXTURES,
+            "receipts": self._receipts(),
+            "query_artifact": QUERY_ARTIFACT,
+            "expected_query_hash": base_hash,
+            "embedding_contract": EMBEDDING_CONTRACT,
+            "expected_embedding_contract_hash": artifact_sha256(EMBEDDING_CONTRACT),
+            "embed": deterministic_embedder([]),
+            "candidates": [self.luna, self.terra],
+            "comparator": self.terra,
+            "manifest_hash": "sha256:" + "a" * 64,
+            "seed": 7,
+            "power_simulations": 20,
+            "selection_mode": "final",
+            "expected_packet_evidence_hash": packet_evidence_hash,
+        }
+        with self.assertRaisesRegex(StudyValidationError, "hash-bound"):
+            run_stage_b_study(**common)
+
+        result = run_stage_b_study(
+            **common,
+            pooled_relevance_artifact=pooled,
+            expected_pooled_relevance_hash=artifact_sha256(pooled),
+            blind_pool_artifact=blind_pool,
+            expected_blind_pool_hash=preliminary["blind_pool_hash"],
+        )
+        self.assertEqual(result["selection_mode"], "final")
+        self.assertEqual(result["pooled_relevance_hash"], artifact_sha256(pooled))
+        self.assertEqual(result["candidates"][0]["selection_mode"], "final")
+        self.assertEqual(result["candidates"][0]["pooled_relevance_hash"], artifact_sha256(pooled))
+
+        tampered = copy.deepcopy(pooled)
+        tampered["query_grades"]["q-1"]["d-1"] = 2
+        with self.assertRaisesRegex(StudyValidationError, "SHA-256"):
+            run_stage_b_study(
+                **common,
+                pooled_relevance_artifact=tampered,
+                expected_pooled_relevance_hash=artifact_sha256(pooled),
+                blind_pool_artifact=blind_pool,
+                expected_blind_pool_hash=preliminary["blind_pool_hash"],
+            )
+
+        missing = copy.deepcopy(pooled)
+        missing["query_grades"]["q-1"].pop(next(iter(blind_pool["query_items"]["q-1"])))
+        with self.assertRaisesRegex(StudyValidationError, "omits"):
+            run_stage_b_study(
+                **common,
+                pooled_relevance_artifact=missing,
+                expected_pooled_relevance_hash=artifact_sha256(missing),
+                blind_pool_artifact=blind_pool,
+                expected_blind_pool_hash=preliminary["blind_pool_hash"],
+            )
+
+        tampered_pool = copy.deepcopy(blind_pool)
+        tampered_pool["query_items"]["q-1"] = tampered_pool["query_items"]["q-1"][1:]
+        tampered_pooled = copy.deepcopy(pooled)
+        tampered_pooled["blind_pool_hash"] = artifact_sha256(tampered_pool)
+        with self.assertRaisesRegex(StudyValidationError, "actual top-ten rankings"):
+            run_stage_b_study(
+                **common,
+                pooled_relevance_artifact=tampered_pooled,
+                expected_pooled_relevance_hash=artifact_sha256(tampered_pooled),
+                blind_pool_artifact=tampered_pool,
+                expected_blind_pool_hash=artifact_sha256(tampered_pool),
+            )
+
+        out_of_range = copy.deepcopy(pooled)
+        out_of_range["query_grades"]["q-1"]["t-1"] = 999
+        with self.assertRaisesRegex(StudyValidationError, "grades are invalid"):
+            run_stage_b_study(
+                **common,
+                pooled_relevance_artifact=out_of_range,
+                expected_pooled_relevance_hash=artifact_sha256(out_of_range),
+                blind_pool_artifact=blind_pool,
+                expected_blind_pool_hash=preliminary["blind_pool_hash"],
+            )
+
+        misbound_packet = copy.deepcopy(pooled)
+        misbound_packet["packet_evidence_hash"] = "sha256:" + "f" * 64
+        with self.assertRaisesRegex(StudyValidationError, "grading packet evidence"):
+            run_stage_b_study(
+                **common,
+                pooled_relevance_artifact=misbound_packet,
+                expected_pooled_relevance_hash=artifact_sha256(misbound_packet),
+                blind_pool_artifact=blind_pool,
+                expected_blind_pool_hash=preliminary["blind_pool_hash"],
+            )
 
     def test_invalid_schema_and_critical_terms_reduce_private_target_metrics(self) -> None:
         receipts = self._receipts()
@@ -297,6 +469,20 @@ class EvalStudyTests(unittest.TestCase):
                 embedding_contract=EMBEDDING_CONTRACT,
                 expected_embedding_contract_hash=artifact_sha256(EMBEDDING_CONTRACT),
                 embed=lambda _text: [float("nan"), 0.0],
+            )
+
+        out_of_range_queries = copy.deepcopy(QUERY_ARTIFACT)
+        out_of_range_queries["queries"][0]["grades"]["t-1"] = 999
+        with self.assertRaisesRegex(StudyValidationError, "zero to three"):
+            run_stage_b_study(
+                **{
+                    **common,
+                    "query_artifact": out_of_range_queries,
+                    "expected_query_hash": artifact_sha256(out_of_range_queries),
+                },
+                embedding_contract=EMBEDDING_CONTRACT,
+                expected_embedding_contract_hash=artifact_sha256(EMBEDDING_CONTRACT),
+                embed=deterministic_embedder([]),
             )
 
 

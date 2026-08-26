@@ -1,0 +1,10 @@
+{
+  "annotation_guide_version": 2,
+  "label_schema_version": 1,
+  "concept_fields": ["diagram_types", "subjects", "visual_style", "colours", "layout", "search_terms"],
+  "ocr_legibilities": ["high", "medium"],
+  "type_metric": "normalised-alias",
+  "critical_metric": "token-phrase",
+  "concept_metric": "token-aware-alias-recall",
+  "semantic_query_policy": "separate-frozen-query-artifact"
+}

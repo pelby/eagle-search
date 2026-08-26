@@ -11,11 +11,14 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from src import db
-from src.captioning.codex_cli import CAPTION_PROVIDER_NAME, CaptionItemFailure
+from src.captioning.codex_cli import CAPTION_INPUT_PREPARATION_VERSION, CAPTION_PROVIDER_NAME, CaptionItemFailure
 from src.captioning.prompt import CAPTION_PROMPT_VERSION
 from src.cli import CliRuntime, build_parser, main
 from src.contracts import CaptionReceiptV1, CaptionResultV1
 from src.persistence.receipts import FileReceiptStore
+from evals.fixture_builder import build_private_manifest
+from evals.report import FROZEN_EVALUATION_THRESHOLDS, FROZEN_FINAL_SELECTION_THRESHOLDS
+from evals.study import artifact_sha256
 
 
 class FakeEmbedder:
@@ -61,6 +64,15 @@ class FakeCaptionProvider:
         )
         receipt_store.put_immutable(receipt)
         return receipt
+
+
+class CountingCaptionProvider(FakeCaptionProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def caption(self, image_path, *, model, effort, receipt_store):
+        self.calls += 1
+        return super().caption(image_path, model=model, effort=effort, receipt_store=receipt_store)
 
 
 class OneItemFailureCaptionProvider(FakeCaptionProvider):
@@ -192,10 +204,84 @@ class CliContractTests(unittest.TestCase):
                 "rebuild",
                 "eval-manifest",
                 "eval-captions",
+                "eval-captions-c",
                 "eval-report",
+                "eval-score",
+                "eval-score-c",
+                "eval-report-c",
             }.issubset(subparsers.choices)
         )
         self.assertEqual(parser.parse_args(["index"]).model, "gpt-5.6-sol")
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parser.parse_args(["eval-captions", "--snapshot", "fixture", "--stage", "C", "--model", "gpt-5.6-sol"])
+
+    def test_stage_c_caption_refuses_tampered_approval_before_provider_call(self) -> None:
+        snapshot = self.home / "evals" / "stage-c"
+        snapshot.mkdir(parents=True)
+        records = [
+            {
+                "image_hash": f"sha256:{index:064x}",
+                "image_path": str(snapshot / f"private-{index}.png"),
+                "stratum": f"stratum-{index % 5}",
+            }
+            for index in range(400)
+        ]
+        manifest = build_private_manifest(
+            records,
+            snapshot_id="stage-c-cli",
+            seed=71,
+            sealing_inputs={
+                "labels_hash": "sha256:" + "1" * 64,
+                "gates_hash": "sha256:" + "2" * 64,
+                "amendment_hash": "sha256:" + "3" * 64,
+                "instrument_version": "selection-instrument-v1",
+                "target_count": 60,
+            },
+        )
+        (snapshot / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+        identities = [f"gpt-5.6-sol:low:{CAPTION_PROMPT_VERSION}"]
+        effects = {
+            "stage_b_effects_version": 2,
+            "stage_b_results_hash": "sha256:" + "4" * 64,
+            "stage_c_candidates": identities,
+            "candidate_powered_target_counts": {identities[0]: 60},
+            "powered_hidden_target_count": 60,
+        }
+        gates = {
+            "stage_c_gates_version": 2,
+            "snapshot_hash": artifact_sha256(manifest),
+            "stage_b_effects_hash": artifact_sha256(effects),
+            "guide_hash": "sha256:" + "5" * 64,
+            "labels_hash": "sha256:" + "6" * 64,
+            "query_artifact_hash": "sha256:" + "7" * 64,
+            "embedding_contract_hash": "sha256:" + "8" * 64,
+            "candidates": identities,
+            "comparator": identities[0],
+            "selection_algorithm": "stratified-shuffle-v1",
+            "selection_seed": 42,
+            "seed": 43,
+            "prompt_version": CAPTION_PROMPT_VERSION,
+            "input_preparation_version": CAPTION_INPUT_PREPARATION_VERSION,
+            "thresholds": FROZEN_EVALUATION_THRESHOLDS,
+            "final_selection_thresholds": FROZEN_FINAL_SELECTION_THRESHOLDS,
+        }
+        approval = {"approval_version": 1, "approved": False, "gates_hash": artifact_sha256(gates)}
+        for name, payload in (("gates.json", gates), ("effects.json", effects), ("approval.json", approval)):
+            (snapshot / name).write_text(json.dumps(payload), encoding="utf-8")
+        provider = CountingCaptionProvider()
+
+        exit_code, payload, _lines, _stderr = self.invoke(
+            [
+                "eval-captions-c", "--snapshot", str(snapshot), "--gates", str(snapshot / "gates.json"),
+                "--approval", str(snapshot / "approval.json"), "--stage-b-effects", str(snapshot / "effects.json"),
+                "--model", "gpt-5.6-sol", "--json",
+            ],
+            caption_provider=provider,
+        )
+
+        self.assertNotEqual(exit_code, 0)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(provider.calls, 0)
 
     def test_eval_caption_stage_uses_private_resumable_journal(self) -> None:
         snapshot = self.home / "evals" / "fixture"

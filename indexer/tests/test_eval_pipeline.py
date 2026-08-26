@@ -45,7 +45,7 @@ def aggregate(model: str, *, critical: int = 0, lower: float = -0.01) -> Candida
         lower_bounds={"ndcg_at_10": lower, "recall_at_10": lower, "concept_f1": lower, "ocr_character_f1": lower},
         lanes={
             "bm25": {"ndcg_at_10": 0.88, "recall_at_10": 0.92, "mrr": 0.8},
-            "nomic": {"ndcg_at_10": 0.86, "recall_at_10": 0.91, "mrr": 0.77},
+            "semantic": {"ndcg_at_10": 0.86, "recall_at_10": 0.91, "mrr": 0.77},
             "rrf": {"ndcg_at_10": 0.90, "recall_at_10": 0.94, "mrr": 0.82},
         },
         latencies_seconds=tuple([1.3, 1.6, 2.2] * 14),
@@ -86,6 +86,8 @@ class FixtureBuilderTests(unittest.TestCase):
         self.assertNotIn("secret-", anonymous)
         self.assertNotIn("image_path", anonymous)
         self.assertNotIn("image_hash", anonymous)
+        for stratum in STRATA:
+            self.assertNotIn(stratum, anonymous)
 
     def test_required_targets_are_included_once_and_count_toward_stratum_quota(self) -> None:
         anchored = candidates()
@@ -188,6 +190,72 @@ class AggregateReportTests(unittest.TestCase):
         self.assertEqual(fallback.status, "inconclusive")
         self.assertEqual(fallback.winner.model, "gpt-5.6-terra")
         self.assertIn("not proven non-inferior", fallback.reason)
+
+    def test_final_selection_independently_blocks_lane_regression_and_ocr_bearing_collapse(self) -> None:
+        final = replace(
+            aggregate("gpt-5.6-luna"),
+            selection_mode="final",
+            pooled_relevance_hash="sha256:" + "a" * 64,
+            ocr_bearing_target_count=8,
+            ocr_bearing_character_f1=0.94,
+            lane_lower_bounds={
+                "bm25": {"ndcg_at_10": -0.01, "recall_at_10": -0.01},
+                "semantic": {"ndcg_at_10": -0.01, "recall_at_10": -0.01},
+            },
+            annotation_guide_version=2,
+            concept_recall=0.84,
+            lower_bounds={
+                "ndcg_at_10": -0.01,
+                "recall_at_10": -0.01,
+                "concept_recall": -0.01,
+                "ocr_character_f1": -0.01,
+            },
+        )
+        self.assertEqual(final.absolute_failures(final_selection=True), ())
+
+        # Extra useful caption terms make the legacy precision/F1 diagnostics
+        # low, but cannot invalidate v2 atomic-concept coverage.
+        diagnostic_only = replace(final, concept_precision=0.20, concept_f1=0.33)
+        self.assertEqual(diagnostic_only.absolute_failures(final_selection=True), ())
+
+        broken = replace(
+            final,
+            ocr_bearing_character_f1=0.80,
+            lane_lower_bounds={
+                **final.lane_lower_bounds,
+                "semantic": {"ndcg_at_10": -0.04, "recall_at_10": -0.01},
+            },
+        )
+        failures = broken.absolute_failures(final_selection=True)
+        self.assertIn("ocr_bearing_character_f1", failures)
+        self.assertIn("semantic_ndcg_at_10", failures)
+
+        low_coverage = replace(final, concept_recall=0.79)
+        self.assertIn("concept_recall", low_coverage.absolute_failures(final_selection=True))
+
+    def test_v2_preliminary_report_uses_coverage_and_ocr_not_legacy_concept_gates(self) -> None:
+        preliminary = replace(
+            aggregate("gpt-5.6-luna"),
+            concept_precision=0.20,
+            concept_f1=0.33,
+            concept_recall=0.79,
+            annotation_guide_version=2,
+            ocr_bearing_target_count=8,
+            ocr_bearing_character_f1=0.80,
+            lower_bounds={
+                "ndcg_at_10": -0.01,
+                "recall_at_10": -0.01,
+                "concept_recall": -0.01,
+                "ocr_character_f1": -0.01,
+            },
+        )
+
+        failures = preliminary.absolute_failures()
+        self.assertNotIn("concept_precision", failures)
+        self.assertNotIn("concept_f1", failures)
+        self.assertIn("concept_recall", failures)
+        self.assertIn("ocr_bearing_character_f1", failures)
+        self.assertEqual(preliminary.noninferiority_failures(), ())
 
 
 if __name__ == "__main__":

@@ -5,12 +5,14 @@ from __future__ import annotations
 import math
 import random
 import re
+import unicodedata
 from dataclasses import dataclass
 from statistics import fmean, stdev
 from typing import Mapping, Sequence
 
 
 _NORMALISE_RE = re.compile(r"[^\w]+", re.UNICODE)
+_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
 
 
 def ndcg_at_k(ranking: Sequence[str], grades: Mapping[str, int], k: int = 10) -> float:
@@ -76,6 +78,26 @@ def ocr_character_f1(predicted: str, expected: str) -> float:
     return 2 * precision * recall / (precision + recall) if precision + recall else 0.0
 
 
+def exact_ocr_character_f1(predicted: str, expected: str) -> float:
+    """Score OCR while preserving punctuation, units, decimals and word boundaries.
+
+    Annotation guide v2 deliberately normalises only Unicode representation,
+    case and repeated whitespace.  Search-significant differences such as
+    ``50`` versus ``50%`` or ``1.5`` versus ``15`` therefore remain errors.
+    """
+
+    def normalise(value: str) -> str:
+        return " ".join(unicodedata.normalize("NFC", value).casefold().split())
+
+    predicted, expected = normalise(predicted), normalise(expected)
+    if not predicted and not expected:
+        return 1.0
+    overlap = _lcs_length(predicted, expected)
+    precision = overlap / len(predicted) if predicted else 0.0
+    recall = overlap / len(expected) if expected else 0.0
+    return 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+
+
 def normalised_character_error_rate(predicted: str, expected: str) -> float:
     predicted, expected = _normalise(predicted), _normalise(expected)
     if not expected:
@@ -102,6 +124,35 @@ def concept_scores(predicted: Sequence[str], expected_groups: Sequence[set[str]]
     recall = matched_groups / len(groups) if groups else 1.0
     f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
     return ConceptScores(precision, recall, f1)
+
+
+def token_phrase_matches(text: str, phrase: str) -> bool:
+    """Match a complete token phrase, never a substring inside another token.
+
+    This deliberately makes ``human`` distinct from ``humanoid`` while still
+    accepting harmless punctuation and case variation in a caption field.
+    """
+
+    haystack = tuple(_TOKEN_RE.findall(text.casefold()))
+    needle = tuple(_TOKEN_RE.findall(phrase.casefold()))
+    return bool(needle) and any(haystack[index : index + len(needle)] == needle for index in range(len(haystack) - len(needle) + 1))
+
+
+def token_aware_concept_recall(predicted: Sequence[str], expected_groups: Sequence[set[str]]) -> float:
+    """Coverage of predeclared atomic concepts using token-aware aliases.
+
+    Precision and F1 remain available through :func:`concept_scores` only as
+    v1 diagnostics; a caption is not penalised for useful extra search terms.
+    """
+
+    groups = [set(group) for group in expected_groups]
+    if not groups:
+        return 1.0
+    matched = sum(
+        any(token_phrase_matches(value, alias) for value in predicted for alias in group)
+        for group in groups
+    )
+    return matched / len(groups)
 
 
 def critical_hallucination_count(flags: Sequence[bool]) -> int:

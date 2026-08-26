@@ -164,10 +164,16 @@ Evaluation artifacts must stay below `~/.eagle-search/evals`. The harness freeze
 ```bash
 uv run python -m src eval-manifest --help
 uv run python -m src eval-captions --help
+uv run python -m src eval-score --help
 uv run python -m src eval-report --help
+uv run python -m src eval-captions-c --help
+uv run python -m src eval-score-c --help
+uv run python -m src eval-report-c --help
 ```
 
-The anonymous report includes quality, retrieval-lane, and latency evidence, but never image paths, hashes, captions, or invented subscription-cost figures.
+`eval-captions` is deliberately limited to Stages A and B. Stage C captions must run through `eval-captions-c`, which requires candidate-specific powered effects, exact gates, and hash-bound approval before it derives the hidden corpus. Final scoring also requires the blind-pool hash, the v2 pooled-relevance artifact and its packet-evidence hash. A positive final report is emitted atomically by `eval-score` or `eval-score-c` while those commands validate and score raw receipts; the standalone report commands intentionally handle preliminary results only.
+
+The v2 harness uses atomic pixel concepts, exact OCR characters, token-safe critical terms, a separate frozen semantic-query artifact, authenticated receipt resealing, source-pixel hash checks, blinded top-ten pooling, and strict Stage C approval seals. The anonymous report includes quality, retrieval-lane, and latency evidence, but never image paths, hashes, captions, stratum names or invented subscription-cost figures. A positive final selection is impossible without complete packet-bound blind pooled-relevance evidence scored from immutable receipts.
 
 ## Safety and reliability properties
 

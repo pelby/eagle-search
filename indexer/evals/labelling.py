@@ -26,6 +26,7 @@ _GUIDE_KEYS = {
     "type_metric",
     "critical_metric",
 }
+_V2_GUIDE_KEYS = _GUIDE_KEYS | {"concept_metric", "semantic_query_policy"}
 _BATCH_KEYS = {"batch_version", "batch_id", "provider", "model", "caption_blind", "guide_hash", "labels"}
 _LABEL_KEYS = {"concept_alias_groups", "image_type_aliases", "ocr_truth", "queries", "critical_absent_terms", "uncertainty"}
 
@@ -43,11 +44,11 @@ def annotation_guide_hash(guide: Mapping[str, Any]) -> str:
     return "sha256:" + sha256(_canonical_json(guide)).hexdigest()
 
 
-def load_annotation_guide() -> dict[str, Any]:
+def load_annotation_guide(version: int = 1) -> dict[str, Any]:
     """Load the frozen guide whose fields are accepted by ``evals.study``."""
 
     try:
-        guide = json.loads(_GUIDE_PATH.read_text(encoding="utf-8"))
+        guide = json.loads(_GUIDE_PATH.with_name(f"annotation-guide-v{version}.json").read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise BlindLabellingError("annotation guide could not be loaded") from error
     _validate_guide(guide)
@@ -114,16 +115,25 @@ def _fixture_id(value: Any, name: str) -> str:
 
 
 def _validate_guide(guide: Any) -> None:
-    if not isinstance(guide, Mapping) or set(guide) != _GUIDE_KEYS:
+    if not isinstance(guide, Mapping):
         raise BlindLabellingError("annotation guide has unexpected fields")
-    if guide["annotation_guide_version"] != 1 or guide["label_schema_version"] != 1:
+    version = guide.get("annotation_guide_version")
+    if version not in {1, 2} or set(guide) != (_GUIDE_KEYS if version == 1 else _V2_GUIDE_KEYS) or guide["label_schema_version"] != 1:
         raise BlindLabellingError("annotation guide version is unsupported")
     if guide["concept_fields"] != ["diagram_types", "subjects", "visual_style", "colours", "layout", "search_terms"]:
         raise BlindLabellingError("annotation guide concept fields are unsupported")
     if guide["ocr_legibilities"] != ["high", "medium"]:
         raise BlindLabellingError("annotation guide OCR legibilities are unsupported")
-    if guide["type_metric"] != "normalised-alias" or guide["critical_metric"] != "normalised-substring":
+    if guide["type_metric"] != "normalised-alias":
         raise BlindLabellingError("annotation guide metrics are unsupported")
+    if version == 1 and guide["critical_metric"] != "normalised-substring":
+        raise BlindLabellingError("annotation guide metrics are unsupported")
+    if version == 2 and (
+        guide["critical_metric"] != "token-phrase"
+        or guide["concept_metric"] != "token-aware-alias-recall"
+        or guide["semantic_query_policy"] != "separate-frozen-query-artifact"
+    ):
+        raise BlindLabellingError("annotation guide v2 metrics or query policy are unsupported")
 
 
 def _validate_label(value: Any, fixture_id: str) -> dict[str, Any]:

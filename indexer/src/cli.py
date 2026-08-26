@@ -35,8 +35,24 @@ from .rebuild import load_legacy_manifest, rebuild_database, snapshot_eagle_reco
 from .watcher.host import WatchGeneratedHost
 from .worker.runtime import RunStatusFile
 from .worker.lock import FileLock
-from evals.cli import aggregate_report_json, create_manifest_json, score_stage_b_json
-from evals.runner import PrivateReceiptJournal, completed_run_keys, load_fixture_manifest, run_caption_stage
+from evals.cli import (
+    _load_json,
+    _stage_c_gate_inputs,
+    aggregate_report_json,
+    aggregate_stage_c_report_json,
+    create_manifest_json,
+    score_stage_b_json,
+    score_stage_c_json,
+)
+from evals.runner import (
+    EvalFixture,
+    FixtureManifest,
+    PrivateReceiptJournal,
+    completed_run_keys,
+    load_fixture_manifest,
+    run_caption_stage,
+)
+from evals.stage_c import _stage_c_corpus
 
 
 def _default_home() -> Path:
@@ -482,9 +498,14 @@ def _command_eval_manifest(arguments: argparse.Namespace, runtime: CliRuntime) -
     }
 
 
-def _command_eval_captions(arguments: argparse.Namespace, runtime: CliRuntime) -> dict[str, Any]:
-    snapshot = _eval_path(runtime, arguments.snapshot)
-    manifest = load_fixture_manifest(snapshot, enforce_private_root=False)
+def _run_eval_captions(
+    arguments: argparse.Namespace,
+    runtime: CliRuntime,
+    *,
+    snapshot: Path,
+    manifest: FixtureManifest,
+    stage: str,
+) -> dict[str, Any]:
     journal = PrivateReceiptJournal(snapshot, enforce_private_root=False)
     receipt_store = FileReceiptStore(snapshot / "model-receipts")
     provider = runtime.caption_provider
@@ -531,13 +552,13 @@ def _command_eval_captions(arguments: argparse.Namespace, runtime: CliRuntime) -
 
     outcome = run_caption_stage(
         manifest,
-        stage=arguments.stage,
+        stage=stage,
         models=arguments.model,
         effort=arguments.effort,
         journal=journal,
         caption=caption,
     )
-    fixture_ids = {fixture.fixture_id for fixture in manifest.fixtures_for(arguments.stage)}
+    fixture_ids = {fixture.fixture_id for fixture in manifest.fixtures_for(stage)}
     requested_models = set(arguments.model)
     completed = sum(
         fixture_id in fixture_ids
@@ -549,13 +570,75 @@ def _command_eval_captions(arguments: argparse.Namespace, runtime: CliRuntime) -
     return {
         "contract_version": 1,
         "ok": not outcome.failed,
-        "stage": arguments.stage,
+        "stage": stage,
         "models": list(arguments.model),
         "created": len(outcome.created),
         "completed": completed,
         "failed": len(outcome.failed),
         "completed_receipts": completed,
     }
+
+
+def _command_eval_captions(arguments: argparse.Namespace, runtime: CliRuntime) -> dict[str, Any]:
+    snapshot = _eval_path(runtime, arguments.snapshot)
+    manifest = load_fixture_manifest(snapshot, enforce_private_root=False)
+    return _run_eval_captions(
+        arguments,
+        runtime,
+        snapshot=snapshot,
+        manifest=manifest,
+        stage=arguments.stage,
+    )
+
+
+def _command_eval_captions_c(arguments: argparse.Namespace, runtime: CliRuntime) -> dict[str, Any]:
+    """Caption only the approved, sealed powered Stage C corpus."""
+
+    snapshot = _eval_path(runtime, arguments.snapshot)
+    raw_manifest, gates, _approval, manifest_hash = _stage_c_gate_inputs(
+        snapshot=snapshot,
+        gates_path=_eval_path(runtime, arguments.gates),
+        approval_path=_eval_path(runtime, arguments.approval),
+        allowed_root=runtime.evals_path,
+    )
+    effects = _load_json(
+        _eval_path(runtime, arguments.stage_b_effects),
+        allowed_root=runtime.evals_path,
+    )
+    corpus, _selected_ids = _stage_c_corpus(
+        snapshot=raw_manifest,
+        gates=gates,
+        stage_b_effects=effects,
+    )
+    allowed_candidates = set(gates.get("candidates", []))
+    requested = {
+        f"{model}:{arguments.effort}:{CAPTION_PROMPT_VERSION}"
+        for model in arguments.model
+    }
+    if requested != allowed_candidates:
+        raise CliRequestError("Stage C caption candidates must exactly match the sealed gates")
+    selected_manifest = FixtureManifest(
+        snapshot_id=str(raw_manifest["snapshot_id"]),
+        fixtures=tuple(
+            EvalFixture(
+                fixture_id=str(fixture["fixture_id"]),
+                image_hash=str(fixture["image_hash"]),
+                image_path=str(fixture["image_path"]),
+                stage="C",
+                stratum=str(fixture["stratum"]),
+                role=str(fixture["role"]),
+            )
+            for fixture in corpus
+        ),
+        manifest_hash=manifest_hash,
+    )
+    return _run_eval_captions(
+        arguments,
+        runtime,
+        snapshot=snapshot,
+        manifest=selected_manifest,
+        stage="C",
+    )
 
 
 def _command_eval_report(arguments: argparse.Namespace, runtime: CliRuntime) -> dict[str, Any]:
@@ -565,11 +648,22 @@ def _command_eval_report(arguments: argparse.Namespace, runtime: CliRuntime) -> 
         snapshot=_eval_path(runtime, arguments.snapshot),
         gates_path=_eval_path(runtime, arguments.gates),
         allowed_root=runtime.evals_path,
+        final_selection=False,
     )
     return {"contract_version": 1, "ok": report["status"] != "failed", **report}
 
 
 def _command_eval_score(arguments: argparse.Namespace, runtime: CliRuntime) -> dict[str, Any]:
+    pooled_path = (
+        _eval_path(runtime, arguments.pooled_relevance)
+        if arguments.pooled_relevance
+        else None
+    )
+    blind_pool_path = (
+        _eval_path(runtime, arguments.blind_pool)
+        if arguments.blind_pool
+        else None
+    )
     result = score_stage_b_json(
         snapshot=_eval_path(runtime, arguments.snapshot),
         guide_path=_eval_path(runtime, arguments.guide), labels_path=_eval_path(runtime, arguments.labels),
@@ -577,8 +671,67 @@ def _command_eval_score(arguments: argparse.Namespace, runtime: CliRuntime) -> d
         gates_path=_eval_path(runtime, arguments.gates), output_path=_eval_path(runtime, arguments.output),
         embed=lambda text: runtime.embedder.embed([text])[0], allowed_root=runtime.evals_path,
         embedder_model=runtime.embedder.model,
+        selection_mode="final" if arguments.final_selection else "preliminary",
+        pooled_relevance_path=pooled_path,
+        expected_pooled_relevance_hash=arguments.pooled_relevance_hash or "",
+        blind_pool_path=blind_pool_path,
+        expected_blind_pool_hash=arguments.blind_pool_hash or "",
+        expected_packet_evidence_hash=arguments.packet_evidence_hash or "",
     )
     return {"contract_version": 1, "ok": True, "created": result["created"], "completed": result["completed"], "output": str(_eval_path(runtime, arguments.output))}
+
+
+def _command_eval_score_c(arguments: argparse.Namespace, runtime: CliRuntime) -> dict[str, Any]:
+    pooled_path = (
+        _eval_path(runtime, arguments.pooled_relevance)
+        if arguments.pooled_relevance
+        else None
+    )
+    blind_pool_path = (
+        _eval_path(runtime, arguments.blind_pool)
+        if arguments.blind_pool
+        else None
+    )
+    result = score_stage_c_json(
+        snapshot=_eval_path(runtime, arguments.snapshot),
+        guide_path=_eval_path(runtime, arguments.guide),
+        labels_path=_eval_path(runtime, arguments.labels),
+        query_path=_eval_path(runtime, arguments.queries),
+        embedding_contract_path=_eval_path(runtime, arguments.embedding_contract),
+        gates_path=_eval_path(runtime, arguments.gates),
+        approval_path=_eval_path(runtime, arguments.approval),
+        stage_b_effects_path=_eval_path(runtime, arguments.stage_b_effects),
+        output_path=_eval_path(runtime, arguments.output),
+        embed=lambda text: runtime.embedder.embed([text])[0],
+        allowed_root=runtime.evals_path,
+        embedder_model=runtime.embedder.model,
+        selection_mode="final" if arguments.final_selection else "preliminary",
+        pooled_relevance_path=pooled_path,
+        expected_pooled_relevance_hash=arguments.pooled_relevance_hash or "",
+        blind_pool_path=blind_pool_path,
+        expected_blind_pool_hash=arguments.blind_pool_hash or "",
+        expected_packet_evidence_hash=arguments.packet_evidence_hash or "",
+    )
+    return {
+        "contract_version": 1,
+        "ok": True,
+        "created": result["created"],
+        "completed": result["completed"],
+        "output": str(_eval_path(runtime, arguments.output)),
+    }
+
+
+def _command_eval_report_c(arguments: argparse.Namespace, runtime: CliRuntime) -> dict[str, Any]:
+    report = aggregate_stage_c_report_json(
+        _eval_path(runtime, arguments.results),
+        _eval_path(runtime, arguments.output),
+        snapshot=_eval_path(runtime, arguments.snapshot),
+        gates_path=_eval_path(runtime, arguments.gates),
+        approval_path=_eval_path(runtime, arguments.approval),
+        allowed_root=runtime.evals_path,
+        final_selection=False,
+    )
+    return {"contract_version": 1, "ok": report["status"] != "failed", **report}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -667,11 +820,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     eval_captions = commands.add_parser("eval-captions", help="Run or resume a private caption-model stage")
     eval_captions.add_argument("--snapshot", required=True)
-    eval_captions.add_argument("--stage", choices=("A", "B", "C"), required=True)
+    eval_captions.add_argument("--stage", choices=("A", "B"), required=True)
     eval_captions.add_argument("--model", action="append", required=True)
     eval_captions.add_argument("--effort", choices=("low", "medium"), default="low")
     eval_captions.add_argument("--json", action="store_true")
     eval_captions.set_defaults(handler=_command_eval_captions)
+
+    eval_captions_c = commands.add_parser(
+        "eval-captions-c",
+        help="Run or resume only an approved sealed powered Stage C corpus",
+    )
+    eval_captions_c.add_argument("--snapshot", required=True)
+    eval_captions_c.add_argument("--gates", required=True)
+    eval_captions_c.add_argument("--approval", required=True)
+    eval_captions_c.add_argument("--stage-b-effects", required=True)
+    eval_captions_c.add_argument("--model", action="append", required=True)
+    eval_captions_c.add_argument("--effort", choices=("low", "medium"), default="low")
+    eval_captions_c.add_argument("--json", action="store_true")
+    eval_captions_c.set_defaults(handler=_command_eval_captions_c)
 
     eval_report = commands.add_parser("eval-report", help="Aggregate private metrics into an anonymous decision report")
     eval_report.add_argument("--results", required=True)
@@ -688,9 +854,43 @@ def build_parser() -> argparse.ArgumentParser:
     eval_score.add_argument("--queries", required=True)
     eval_score.add_argument("--embedding-contract", required=True)
     eval_score.add_argument("--gates", required=True)
+    eval_score.add_argument("--pooled-relevance")
+    eval_score.add_argument("--pooled-relevance-hash")
+    eval_score.add_argument("--blind-pool")
+    eval_score.add_argument("--blind-pool-hash")
+    eval_score.add_argument("--packet-evidence-hash")
+    eval_score.add_argument("--final-selection", action="store_true")
     eval_score.add_argument("--output", required=True)
     eval_score.add_argument("--json", action="store_true")
     eval_score.set_defaults(handler=_command_eval_score)
+
+    eval_score_c = commands.add_parser("eval-score-c", help="Score a sealed hidden Stage C corpus")
+    eval_score_c.add_argument("--snapshot", required=True)
+    eval_score_c.add_argument("--guide", required=True)
+    eval_score_c.add_argument("--labels", required=True)
+    eval_score_c.add_argument("--queries", required=True)
+    eval_score_c.add_argument("--embedding-contract", required=True)
+    eval_score_c.add_argument("--gates", required=True)
+    eval_score_c.add_argument("--approval", required=True)
+    eval_score_c.add_argument("--stage-b-effects", required=True)
+    eval_score_c.add_argument("--pooled-relevance")
+    eval_score_c.add_argument("--pooled-relevance-hash")
+    eval_score_c.add_argument("--blind-pool")
+    eval_score_c.add_argument("--blind-pool-hash")
+    eval_score_c.add_argument("--packet-evidence-hash")
+    eval_score_c.add_argument("--final-selection", action="store_true")
+    eval_score_c.add_argument("--output", required=True)
+    eval_score_c.add_argument("--json", action="store_true")
+    eval_score_c.set_defaults(handler=_command_eval_score_c)
+
+    eval_report_c = commands.add_parser("eval-report-c", help="Report a sealed hidden Stage C decision")
+    eval_report_c.add_argument("--results", required=True)
+    eval_report_c.add_argument("--output", required=True)
+    eval_report_c.add_argument("--snapshot", required=True)
+    eval_report_c.add_argument("--gates", required=True)
+    eval_report_c.add_argument("--approval", required=True)
+    eval_report_c.add_argument("--json", action="store_true")
+    eval_report_c.set_defaults(handler=_command_eval_report_c)
     return parser
 
 

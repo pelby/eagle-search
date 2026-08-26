@@ -13,7 +13,9 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from src.selection_instrument import SelectionDocument, SelectionInstrument
 from src.captioning.codex_cli import CaptionItemFailure
+from src.captioning.codex_cli import CAPTION_PROVIDER_NAME
 from src.captioning.prompt import CAPTION_PROMPT_VERSION
+from src.contracts import CaptionReceiptV1, ContractError
 
 from .metrics import ndcg_at_k, recall_at_k, reciprocal_rank
 
@@ -278,6 +280,96 @@ class CaptionStageOutcome:
 
     created: tuple[dict[str, Any], ...]
     failed: tuple[dict[str, Any], ...]
+
+
+def reseal_authenticated_receipt_journal(
+    *,
+    source_snapshot: Path,
+    destination_snapshot: Path,
+    source_manifest: FixtureManifest,
+    destination_manifest: FixtureManifest,
+    candidate: tuple[str, str, str],
+    enforce_private_root: bool = True,
+) -> int:
+    """Copy only exact authenticated receipt evidence into a new private journal.
+
+    This deliberately has no caption-provider dependency.  A receipt may be
+    reused only when fixture ID/image hash, candidate identity and prompt are
+    identical; the destination receives a new manifest binding while retaining
+    the immutable receipt ID and caption content exactly.
+    """
+
+    source_root = assert_private_snapshot(source_snapshot) if enforce_private_root else Path(source_snapshot).resolve()
+    destination_root = assert_private_snapshot(destination_snapshot) if enforce_private_root else Path(destination_snapshot).resolve()
+    if source_root == destination_root:
+        raise ValueError("receipt resealing requires a distinct destination snapshot")
+    if source_manifest.manifest_hash == destination_manifest.manifest_hash:
+        raise ValueError("receipt resealing requires a new destination manifest")
+    fixture_identities = {
+        fixture.fixture_id: (
+            fixture.image_hash,
+            fixture.stage,
+            fixture.role,
+            fixture.stratum,
+        )
+        for fixture in source_manifest.fixtures
+    }
+    if fixture_identities != {
+        fixture.fixture_id: (
+            fixture.image_hash,
+            fixture.stage,
+            fixture.role,
+            fixture.stratum,
+        )
+        for fixture in destination_manifest.fixtures
+    }:
+        raise ValueError("receipt resealing requires exact fixture IDs, hashes, stages, roles and strata")
+    fixture_hashes = {
+        fixture_id: identity[0]
+        for fixture_id, identity in fixture_identities.items()
+    }
+    source_journal = PrivateReceiptJournal(source_root, enforce_private_root=False)
+    destination_journal = PrivateReceiptJournal(destination_root, enforce_private_root=False)
+    model, effort, prompt_version = candidate
+    copied = 0
+    for journal in source_journal.load():
+        if journal.get("state") == "failed" or (journal.get("model"), journal.get("effort"), journal.get("prompt_version")) != candidate:
+            continue
+        fixture_id, image_hash, receipt_id = journal.get("fixture_id"), journal.get("image_hash"), journal.get("receipt_id")
+        if not isinstance(fixture_id, str) or fixture_hashes.get(fixture_id) != image_hash or not isinstance(receipt_id, str):
+            raise ValueError("source receipt journal is not bound to its source manifest")
+        if journal.get("manifest_hash") != source_manifest.manifest_hash:
+            raise ValueError("source receipt journal manifest binding is invalid")
+        receipt_path = source_root / "model-receipts" / image_hash / f"{receipt_id}.json"
+        try:
+            immutable = CaptionReceiptV1.from_dict(json.loads(receipt_path.read_text(encoding="utf-8")))
+        except (OSError, json.JSONDecodeError, ContractError, TypeError, AttributeError) as error:
+            raise ValueError("authenticated immutable receipt is unavailable or invalid") from error
+        if (
+            immutable.provider != CAPTION_PROVIDER_NAME
+            or immutable.source != "vision"
+            or (immutable.model, immutable.effort, immutable.prompt_version) != candidate
+            or immutable.image_hash != image_hash
+            or journal.get("caption_result") != immutable.caption_result.to_dict()
+            or journal.get("search_text") != immutable.search_text
+        ):
+            raise ValueError("source journal does not exactly match authenticated immutable receipt")
+        destination_receipt_path = destination_root / "model-receipts" / image_hash / f"{receipt_id}.json"
+        immutable_payload = immutable.to_dict()
+        if destination_receipt_path.exists():
+            try:
+                existing = json.loads(destination_receipt_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise ValueError("destination immutable receipt is invalid") from error
+            if existing != immutable_payload:
+                raise ValueError("destination immutable receipt conflicts with authenticated evidence")
+        else:
+            _write_private_json(destination_receipt_path, immutable_payload)
+        destination_journal.put({**journal, "manifest_hash": destination_manifest.manifest_hash})
+        copied += 1
+    if copied == 0:
+        raise ValueError("no authenticated receipts matched the requested candidate")
+    return copied
 
 
 def run_caption_stage(

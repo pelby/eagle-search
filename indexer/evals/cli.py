@@ -15,10 +15,12 @@ from .fixture_builder import build_private_manifest, private_manifest_summary
 from .report import (
     CandidateAggregate,
     FROZEN_EVALUATION_THRESHOLDS,
+    FROZEN_FINAL_SELECTION_THRESHOLDS,
     decide_winner,
     render_anonymised_report,
 )
 from .runner import PRIVATE_EVAL_ROOT, load_fixture_manifest
+from .stage_c import StageCValidationError, run_stage_c_study, validate_stage_c_approval
 from .study import CandidateSpec, StudyValidationError, artifact_sha256, run_stage_b_study
 from src.contracts import CaptionReceiptV1, ContractError
 from src.captioning.codex_cli import CAPTION_INPUT_PREPARATION_VERSION, CAPTION_PROVIDER_NAME
@@ -30,7 +32,7 @@ class EvalCliError(ValueError):
     """A safe, stable private-evaluation CLI-support failure."""
 
 
-_GATE_KEYS = {
+_V1_GATE_KEYS = {
     "gates_version",
     "guide_hash",
     "labels_hash",
@@ -42,6 +44,7 @@ _GATE_KEYS = {
     "input_preparation_version",
     "thresholds",
 }
+_V2_GATE_KEYS = _V1_GATE_KEYS | {"final_selection_thresholds"}
 
 
 def _root(path: Path | None) -> Path:
@@ -128,14 +131,19 @@ def create_manifest_json(
 
 
 def _candidate(payload: Mapping[str, Any]) -> CandidateAggregate:
-    fields = {
+    required_fields = {
         "model", "effort", "schema_valid_rate", "critical_hallucinations", "concept_precision", "concept_f1",
         "ocr_character_f1", "ndcg_at_10", "recall_at_10", "known_query_passed",
         "background_throughput_accepted", "lower_bounds", "lanes", "latencies_seconds",
     }
-    if not fields.issubset(payload):
+    optional_fields = {
+        "lane_lower_bounds", "ocr_bearing_target_count", "ocr_bearing_character_f1",
+        "strata", "selection_mode", "pooled_relevance_hash", "concept_recall", "annotation_guide_version",
+    }
+    if not required_fields.issubset(payload):
         raise EvalCliError("evaluation candidate is missing aggregate metrics")
     try:
+        fields = required_fields | (optional_fields & set(payload))
         return CandidateAggregate(**{field: payload[field] for field in fields})
     except (TypeError, ValueError) as error:
         raise EvalCliError("evaluation candidate has invalid aggregate metrics") from error
@@ -161,7 +169,16 @@ def _sealed_gates(
     if not isinstance(sealing, Mapping):
         raise EvalCliError("sealed private manifest is required")
     gates = _load_json(gates_path, allowed_root=allowed_root)
-    if not isinstance(gates, Mapping) or set(gates) != _GATE_KEYS or gates.get("gates_version") != 1:
+    if not isinstance(gates, Mapping):
+        raise EvalCliError("sealed gates artifact is invalid")
+    gate_version = gates.get("gates_version")
+    if gate_version == 1:
+        expected_keys = _V1_GATE_KEYS
+    elif gate_version == 2:
+        expected_keys = _V2_GATE_KEYS
+    else:
+        raise EvalCliError("sealed gates artifact is invalid")
+    if set(gates) != expected_keys:
         raise EvalCliError("sealed gates artifact is invalid")
     gates_hash = artifact_sha256(gates)
     if gates_hash != sealing.get("gates_hash") or gates.get("labels_hash") != sealing.get("labels_hash"):
@@ -174,6 +191,8 @@ def _sealed_gates(
         raise EvalCliError("sealed image preparation does not match the runtime")
     if gates.get("thresholds") != FROZEN_EVALUATION_THRESHOLDS:
         raise EvalCliError("sealed decision thresholds do not match the runtime")
+    if gate_version == 2 and gates.get("final_selection_thresholds") != FROZEN_FINAL_SELECTION_THRESHOLDS:
+        raise EvalCliError("sealed final-selection thresholds do not match the runtime")
     if not all(
         isinstance(gates.get(key), str) and gates[key]
         for key in ("guide_hash", "labels_hash", "query_artifact_hash", "embedding_contract_hash", "comparator")
@@ -195,8 +214,14 @@ def aggregate_report_json(
     snapshot: Path,
     gates_path: Path,
     allowed_root: Path | None = None,
+    final_selection: bool = False,
 ) -> dict[str, Any]:
     """Decide only from a sealed score envelope and its exact gate contract."""
+
+    if final_selection:
+        raise EvalCliError(
+            "final selection reports are emitted only by eval-score while it validates and scores the sealed raw evidence"
+        )
 
     raw_manifest = _load_json(Path(snapshot) / "manifest.json", allowed_root=allowed_root)
     if not isinstance(raw_manifest, Mapping):
@@ -230,6 +255,25 @@ def aggregate_report_json(
     }
     if any(raw.get(key) != value for key, value in expected_evidence.items()):
         raise EvalCliError("evaluation results do not match the sealed decision evidence")
+    expected_mode = "final" if final_selection else "preliminary"
+    if raw.get("selection_mode", "preliminary") != expected_mode:
+        raise EvalCliError("final selection requires a matching final score envelope")
+    if final_selection and (
+        not isinstance(raw.get("pooled_relevance_hash"), str)
+        or not str(raw["pooled_relevance_hash"]).startswith("sha256:")
+        or not isinstance(raw.get("blind_pool_hash"), str)
+        or not str(raw["blind_pool_hash"]).startswith("sha256:")
+    ):
+        raise EvalCliError("final selection requires hash-bound blind-pool and pooled-relevance evidence")
+    if final_selection and raw.get("annotation_guide_version") != 2:
+        raise EvalCliError("final selection requires annotation guide v2")
+    if final_selection and (
+        gates.get("gates_version") != 2
+        or raw.get("gates_version") != 2
+        or raw.get("final_selection_thresholds") != gates.get("final_selection_thresholds")
+        or raw.get("final_selection_thresholds") != FROZEN_FINAL_SELECTION_THRESHOLDS
+    ):
+        raise EvalCliError("final selection requires exact sealed final-selection thresholds")
     result_identities = {
         (candidate.get("model"), candidate.get("effort"), candidate.get("prompt_version"))
         for candidate in raw["candidates"]
@@ -239,6 +283,7 @@ def aggregate_report_json(
     decision = decide_winner(
         [_candidate(candidate) for candidate in raw["candidates"]],
         comparator=comparator.model,
+        final_selection=final_selection,
     )
     report = render_anonymised_report(decision)
     _write_json(output_path, report, allowed_root=allowed_root)
@@ -314,6 +359,12 @@ def score_stage_b_json(
     embed: Callable[[str], Sequence[float]],
     allowed_root: Path | None = None,
     embedder_model: str = "",
+    selection_mode: str = "preliminary",
+    pooled_relevance_path: Path | None = None,
+    expected_pooled_relevance_hash: str = "",
+    blind_pool_path: Path | None = None,
+    expected_blind_pool_hash: str = "",
+    expected_packet_evidence_hash: str = "",
 ) -> dict[str, Any]:
     """Score completed private Stage B receipts; never accept aggregate metrics."""
     raw_manifest = _load_json(Path(snapshot) / "manifest.json", allowed_root=allowed_root)
@@ -328,9 +379,21 @@ def score_stage_b_json(
         gates_path=gates_path,
         allowed_root=allowed_root,
     )
+    if selection_mode == "final" and gates["gates_version"] != 2:
+        raise EvalCliError("final Stage B scoring requires sealed gates v2")
     guide = _load_json(guide_path, allowed_root=allowed_root)
     labels = _load_json(labels_path, allowed_root=allowed_root)
     queries = _load_json(query_path, allowed_root=allowed_root)
+    pooled_relevance = (
+        _load_json(pooled_relevance_path, allowed_root=allowed_root)
+        if pooled_relevance_path is not None
+        else None
+    )
+    blind_pool = (
+        _load_json(blind_pool_path, allowed_root=allowed_root)
+        if blind_pool_path is not None
+        else None
+    )
     contract = _load_json(embedding_contract_path, allowed_root=allowed_root)
     if not isinstance(contract, Mapping) or contract.get("model") != embedder_model or contract.get("dimensions") != VECTOR_DIMENSIONS:
         raise EvalCliError("production embedder does not match the frozen embedding contract")
@@ -342,6 +405,12 @@ def score_stage_b_json(
             guide=guide, labels=labels, expected_guide_hash=gates["guide_hash"], expected_labels_hash=gates["labels_hash"],
             fixtures=raw_manifest.get("fixtures", []), receipts=receipts,
             query_artifact=queries, expected_query_hash=gates["query_artifact_hash"],
+            pooled_relevance_artifact=pooled_relevance,
+            expected_pooled_relevance_hash=expected_pooled_relevance_hash,
+            blind_pool_artifact=blind_pool,
+            expected_blind_pool_hash=expected_blind_pool_hash,
+            expected_packet_evidence_hash=expected_packet_evidence_hash,
+            selection_mode=selection_mode,
             embedding_contract=contract, expected_embedding_contract_hash=gates["embedding_contract_hash"],
             embed=embed, candidates=specs, comparator=chosen,
             manifest_hash=manifest.manifest_hash, seed=int(raw_manifest["seed"]),
@@ -350,9 +419,12 @@ def score_stage_b_json(
         raise EvalCliError("sealed Stage B study could not be scored") from error
     result["created"] = 0
     result["gates_hash"] = gates_hash
+    result["gates_version"] = gates["gates_version"]
     result["comparator"] = gates["comparator"]
     result["input_preparation_version"] = CAPTION_INPUT_PREPARATION_VERSION
     result["thresholds"] = FROZEN_EVALUATION_THRESHOLDS
+    if gates["gates_version"] == 2:
+        result["final_selection_thresholds"] = FROZEN_FINAL_SELECTION_THRESHOLDS
     stage_b_ids = {fixture.fixture_id for fixture in manifest.fixtures_for("B")}
     wanted = {spec.receipt_key() for spec in specs}
     result["completed"] = sum(
@@ -360,5 +432,221 @@ def score_stage_b_json(
         and (receipt.get("model"), receipt.get("effort"), receipt.get("prompt_version")) in wanted
         for receipt in receipts
     )
+    if selection_mode == "final":
+        decision = decide_winner(
+            [_candidate(candidate) for candidate in result["candidates"]],
+            comparator=chosen.model,
+            final_selection=True,
+        )
+        result["decision_report"] = render_anonymised_report(decision)
     _write_json(output_path, result, allowed_root=allowed_root)
     return result
+
+
+def _stage_c_gate_inputs(
+    *,
+    snapshot: Path,
+    gates_path: Path,
+    approval_path: Path,
+    allowed_root: Path | None,
+) -> tuple[dict[str, Any], dict[str, Any], Mapping[str, Any], str]:
+    raw_manifest = _load_json(Path(snapshot) / "manifest.json", allowed_root=allowed_root)
+    gates = _load_json(gates_path, allowed_root=allowed_root)
+    approval = _load_json(approval_path, allowed_root=allowed_root)
+    if not isinstance(raw_manifest, Mapping) or not isinstance(gates, Mapping) or not isinstance(approval, Mapping):
+        raise EvalCliError("sealed Stage C manifest, gates and approval are required")
+    try:
+        manifest = load_fixture_manifest(Path(snapshot), enforce_private_root=False)
+    except (OSError, ValueError) as error:
+        raise EvalCliError("sealed private manifest is invalid") from error
+    if artifact_sha256(raw_manifest) != manifest.manifest_hash:
+        raise EvalCliError("Stage C manifest hash is inconsistent")
+    if (
+        gates.get("stage_c_gates_version") != 2
+        or gates.get("snapshot_hash") != manifest.manifest_hash
+        or gates.get("prompt_version") != CAPTION_PROMPT_VERSION
+        or gates.get("input_preparation_version") != CAPTION_INPUT_PREPARATION_VERSION
+        or gates.get("thresholds") != FROZEN_EVALUATION_THRESHOLDS
+        or gates.get("final_selection_thresholds") != FROZEN_FINAL_SELECTION_THRESHOLDS
+    ):
+        raise EvalCliError("Stage C gates or human approval do not match the runtime seal")
+    try:
+        validate_stage_c_approval(approval, gates=gates)
+    except StageCValidationError as error:
+        raise EvalCliError("Stage C gates or human approval do not match the runtime seal") from error
+    return dict(raw_manifest), dict(gates), approval, manifest.manifest_hash
+
+
+def score_stage_c_json(
+    *,
+    snapshot: Path,
+    guide_path: Path,
+    labels_path: Path,
+    query_path: Path,
+    embedding_contract_path: Path,
+    gates_path: Path,
+    approval_path: Path,
+    stage_b_effects_path: Path,
+    output_path: Path,
+    embed: Callable[[str], Sequence[float]],
+    allowed_root: Path | None = None,
+    embedder_model: str = "",
+    selection_mode: str = "preliminary",
+    pooled_relevance_path: Path | None = None,
+    expected_pooled_relevance_hash: str = "",
+    blind_pool_path: Path | None = None,
+    expected_blind_pool_hash: str = "",
+    expected_packet_evidence_hash: str = "",
+) -> dict[str, Any]:
+    """Score the deterministic hidden Stage C corpus from immutable receipts."""
+
+    raw_manifest, gates, approval, manifest_hash = _stage_c_gate_inputs(
+        snapshot=snapshot,
+        gates_path=gates_path,
+        approval_path=approval_path,
+        allowed_root=allowed_root,
+    )
+    guide = _load_json(guide_path, allowed_root=allowed_root)
+    labels = _load_json(labels_path, allowed_root=allowed_root)
+    queries = _load_json(query_path, allowed_root=allowed_root)
+    effects = _load_json(stage_b_effects_path, allowed_root=allowed_root)
+    contract = _load_json(embedding_contract_path, allowed_root=allowed_root)
+    pooled_relevance = (
+        _load_json(pooled_relevance_path, allowed_root=allowed_root)
+        if pooled_relevance_path is not None
+        else None
+    )
+    blind_pool = (
+        _load_json(blind_pool_path, allowed_root=allowed_root)
+        if blind_pool_path is not None
+        else None
+    )
+    if (
+        not isinstance(guide, Mapping)
+        or not isinstance(labels, Mapping)
+        or not isinstance(queries, Mapping)
+        or not isinstance(effects, Mapping)
+        or not isinstance(contract, Mapping)
+    ):
+        raise EvalCliError("Stage C study artifacts are invalid")
+    if contract.get("model") != embedder_model or contract.get("dimensions") != VECTOR_DIMENSIONS:
+        raise EvalCliError("production embedder does not match the frozen embedding contract")
+    receipts = _validated_caption_receipts(Path(snapshot), allowed_root=allowed_root)
+    if not receipts:
+        raise EvalCliError("Stage C scoring requires completed caption receipts")
+    try:
+        result = run_stage_c_study(
+            snapshot=raw_manifest,
+            gates=gates,
+            approval=approval,
+            stage_b_effects=effects,
+            guide=guide,
+            labels=labels,
+            queries=queries,
+            embedding_contract=contract,
+            receipts=receipts,
+            embed=embed,
+            pooled_relevance=pooled_relevance,
+            expected_pooled_relevance_hash=expected_pooled_relevance_hash,
+            blind_pool=blind_pool,
+            expected_blind_pool_hash=expected_blind_pool_hash,
+            expected_packet_evidence_hash=expected_packet_evidence_hash,
+            selection_mode=selection_mode,
+        )
+    except (StageCValidationError, TypeError, ValueError) as error:
+        raise EvalCliError("sealed Stage C study could not be scored") from error
+    result["created"] = 0
+    result["manifest_hash"] = manifest_hash
+    result["gates_hash"] = artifact_sha256(gates)
+    result["comparator"] = gates["comparator"]
+    result["input_preparation_version"] = CAPTION_INPUT_PREPARATION_VERSION
+    result["thresholds"] = FROZEN_EVALUATION_THRESHOLDS
+    result["stage_c_gates_version"] = 2
+    result["final_selection_thresholds"] = FROZEN_FINAL_SELECTION_THRESHOLDS
+    if selection_mode == "final":
+        comparator = _candidate_spec(str(gates["comparator"]))
+        decision = decide_winner(
+            [_candidate(candidate) for candidate in result["candidates"]],
+            comparator=comparator.model,
+            final_selection=True,
+        )
+        result["decision_report"] = render_anonymised_report(decision)
+    _write_json(output_path, result, allowed_root=allowed_root)
+    return result
+
+
+def aggregate_stage_c_report_json(
+    results_path: Path,
+    output_path: Path,
+    *,
+    snapshot: Path,
+    gates_path: Path,
+    approval_path: Path,
+    allowed_root: Path | None = None,
+    final_selection: bool = False,
+) -> dict[str, Any]:
+    """Decide from Stage C evidence without accepting a free comparator."""
+
+    if final_selection:
+        raise EvalCliError(
+            "final Stage C reports are emitted only by eval-score-c while it validates and scores the sealed raw evidence"
+        )
+
+    _manifest, gates, approval, manifest_hash = _stage_c_gate_inputs(
+        snapshot=snapshot,
+        gates_path=gates_path,
+        approval_path=approval_path,
+        allowed_root=allowed_root,
+    )
+    raw = _load_json(results_path, allowed_root=allowed_root)
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("candidates"), list):
+        raise EvalCliError("Stage C results JSON must contain candidates")
+    if any(not isinstance(candidate, Mapping) for candidate in raw["candidates"]):
+        raise EvalCliError("Stage C result candidates must be aggregate objects")
+    if any(candidate.get("background_throughput_accepted") is not False for candidate in raw["candidates"]):
+        raise EvalCliError("background throughput requires a separately sealed amendment")
+    expected_mode = "final" if final_selection else "preliminary"
+    expected = {
+        "stage": "C",
+        "manifest_hash": manifest_hash,
+        "stage_c_gates_hash": artifact_sha256(gates),
+        "approval_hash": artifact_sha256(approval),
+        "guide_hash": gates["guide_hash"],
+        "labels_hash": gates["labels_hash"],
+        "query_artifact_hash": gates["query_artifact_hash"],
+        "embedding_contract_hash": gates["embedding_contract_hash"],
+        "gates_hash": artifact_sha256(gates),
+        "comparator": gates["comparator"],
+        "selection_mode": expected_mode,
+        "input_preparation_version": CAPTION_INPUT_PREPARATION_VERSION,
+        "thresholds": FROZEN_EVALUATION_THRESHOLDS,
+        "stage_c_gates_version": 2,
+        "final_selection_thresholds": FROZEN_FINAL_SELECTION_THRESHOLDS,
+    }
+    if any(raw.get(key) != value for key, value in expected.items()):
+        raise EvalCliError("Stage C results do not match the sealed decision evidence")
+    if final_selection and (
+        not isinstance(raw.get("pooled_relevance_hash"), str)
+        or not raw["pooled_relevance_hash"].startswith("sha256:")
+        or not isinstance(raw.get("blind_pool_hash"), str)
+        or not raw["blind_pool_hash"].startswith("sha256:")
+    ):
+        raise EvalCliError("final Stage C selection requires blind-pool and pooled relevance evidence")
+    if final_selection and raw.get("annotation_guide_version") != 2:
+        raise EvalCliError("final Stage C selection requires annotation guide v2")
+    specs = [_candidate_spec(value) for value in gates.get("candidates", [])]
+    comparator = _candidate_spec(gates.get("comparator", ""))
+    identities = {
+        (candidate.get("model"), candidate.get("effort"), candidate.get("prompt_version"))
+        for candidate in raw["candidates"]
+    }
+    if not specs or comparator not in specs or identities != {spec.receipt_key() for spec in specs}:
+        raise EvalCliError("Stage C result candidates do not match the sealed gates")
+    decision = decide_winner(
+        [_candidate(candidate) for candidate in raw["candidates"]],
+        comparator=comparator.model,
+        final_selection=final_selection,
+    )
+    report = render_anonymised_report(decision)
+    _write_json(output_path, report, allowed_root=allowed_root)
+    return report
